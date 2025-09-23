@@ -10,7 +10,7 @@ from telegram.error import BadRequest
 from telegram.constants import ChatType
 
 import config
-from search import get_details, get_best_backdrop_path, get_content_rating
+# NOTE: The faulty import from 'search' has been removed.
 
 # --- Setup Logging ---
 logger = logging.getLogger(__name__)
@@ -84,9 +84,7 @@ async def get_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Step 2: Send the <b>title</b>. HTML is supported.", parse_mode="HTML")
     return config.GET_TITLE
 
-# --- THIS IS THE CORRECTED FUNCTION ---
 async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Use .text_html to preserve formatting like <b>, <i>, etc.
     context.user_data['broadcast_title'] = update.message.text_html 
     await update.message.reply_text("Step 3: Send the <b>description</b>. HTML is supported.", parse_mode="HTML")
     return config.GET_DESCRIPTION
@@ -171,7 +169,6 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         final_keyboard_list = build_keyboard(doc_with_id)
         reply_markup = InlineKeyboardMarkup(final_keyboard_list) if final_keyboard_list else None
         
-        # This is also corrected to not add extra bold tags
         caption = f"{broadcast_doc['title']}\n\n{broadcast_doc['description']}"
         
         if len(caption) > 1024:
