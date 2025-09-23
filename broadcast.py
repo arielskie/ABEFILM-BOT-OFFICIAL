@@ -1,13 +1,18 @@
 import collections
 import io
 import json
+import logging
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 from telegram.error import BadRequest
+from telegram.constants import ChatType
 
 import config
 from search import get_details, get_best_backdrop_path
+
+# --- Setup Logging ---
+logger = logging.getLogger(__name__)
 
 # --- Helper Functions ---
 
@@ -24,10 +29,12 @@ def get_content_rating(tmdb_id, media_type):
             response = requests.get(url, params={"api_key": config.TMDB_API_KEY}).json()
             for result in response.get("results", []):
                 if result.get("iso_3166_1") == "US": return result.get("rating")
-    except Exception as e: print(f"Error fetching content rating: {e}")
+    except Exception as e:
+        logger.error(f"Error fetching content rating for {tmdb_id}: {e}")
     return None
 
 def generate_post_code(user_id, tmdb_id, media_type, user_collection, default_sources, season=1, num_episodes=8):
+    # This function is not used by the broadcast flow but is kept for other potential uses.
     user_data = user_collection.find_one({"user_id": user_id})
     user_sources = user_data.get("video_sources", []) if user_data else []
     all_sources = default_sources + user_sources
@@ -84,38 +91,57 @@ def generate_copyable_description(tmdb_id, media_type):
 
 async def check_bot_permissions(context: ContextTypes.DEFAULT_TYPE, chat_id):
     try:
+        chat = await context.bot.get_chat(chat_id)
         bot_id = context.bot.id
         member = await context.bot.get_chat_member(chat_id, bot_id)
-        if member.status == 'administrator' and member.can_post_messages:
+
+        if member.status != 'administrator':
+            return False, "I am not an admin in the target chat."
+
+        if chat.type == ChatType.CHANNEL:
+            if member.can_post_messages:
+                return True, None
+            else:
+                return False, "I am an admin in the channel, but I don't have the 'Post Messages' permission."
+
+        elif chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             return True, None
-        elif member.status != 'administrator':
-            return False, "I am not an admin in the target channel."
-        else:
-            return False, "I am an admin, but I don't have permission to post messages."
+            
+        return False, f"Broadcasting to this chat type ({chat.type}) is not supported."
+
     except BadRequest as e:
         if "chat not found" in e.message.lower():
-            return False, "I could not find the channel. Make sure I have been added to it."
+            return False, "I could not find the chat. Make sure the ID/username is correct and I have been added."
         return False, f"A Telegram error occurred: {e.message}"
     except Exception as e:
+        logger.error(f"Unexpected error in check_bot_permissions for chat {chat_id}: {e}")
         return False, f"An unexpected error occurred: {e}"
 
 def build_keyboard(doc):
-    final_keyboard = []; reaction_keyboard = []
+    final_keyboard = []
+    reaction_keyboard = []
     reaction_emojis = doc.get("reaction_emojis", [])
     if reaction_emojis:
-        reactions = doc.get("reactions", {}); counts = collections.Counter(reactions.values())
+        reactions = doc.get("reactions", {})
+        counts = collections.Counter(reactions.values())
         for emoji in reaction_emojis:
-            count = counts.get(emoji, 0); callback_data = f"react_{doc['_id']}_{emoji}"
+            count = counts.get(emoji, 0)
+            callback_data = f"react_{doc['_id']}_{emoji}"
             reaction_keyboard.append(InlineKeyboardButton(f"{emoji} {count}", callback_data=callback_data))
-    if reaction_keyboard: final_keyboard.append(reaction_keyboard)
-    buttons_raw = doc.get("buttons_raw", "none")
-    if buttons_raw.lower().strip() != 'none':
+    if reaction_keyboard:
+        final_keyboard.append(reaction_keyboard)
+        
+    buttons_raw = doc.get("buttons_raw", "")
+    if buttons_raw and buttons_raw.lower().strip() != 'none':
         for line in buttons_raw.strip().split('\n'):
-            button_row = []; button_parts = line.split('|')
+            button_row = []
+            button_parts = line.split('|')
             for part in button_parts:
-                sub_parts = part.split(' - ')
-                if len(sub_parts) == 2: button_row.append(InlineKeyboardButton(sub_parts[0].strip(), url=sub_parts[1].strip()))
-            if button_row: final_keyboard.append(button_row)
+                sub_parts = [p.strip() for p in part.split(' - ')]
+                if len(sub_parts) == 2:
+                    button_row.append(InlineKeyboardButton(sub_parts[0], url=sub_parts[1]))
+            if button_row:
+                final_keyboard.append(button_row)
     return final_keyboard
 
 # --- Broadcast Handlers ---
@@ -134,34 +160,23 @@ async def get_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['broadcast_title'] = update.message.text
-    if 'copied_description' in context.user_data:
-        context.user_data['broadcast_description'] = context.user_data.pop('copied_description')
-        await update.message.reply_text(
-            "✅ Using your copied description.\n\nStep 4: Send the <b>URL buttons</b>.\n\n"
-            "<i>Use a new line for each row, and `|` to separate buttons on the same row.</i>\n\n"
-            "<u>Example:</u>\n<code>Watch Now - https://... | Trailer - https://...</code>\n"
-            "<code>Our Website - https://...</code>",
-            parse_mode="HTML", disable_web_page_preview=True
-        )
-        return config.GET_BUTTONS
-    else:
-        await update.message.reply_text("Step 3: Send the <b>description</b>. HTML is supported.", parse_mode="HTML")
-        return config.GET_DESCRIPTION
+    await update.message.reply_text("Step 3: Send the <b>description</b>. HTML is supported.", parse_mode="HTML")
+    return config.GET_DESCRIPTION
 
 async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['broadcast_description'] = update.message.text
+    context.user_data['broadcast_description'] = update.message.text_html
     await update.message.reply_text(
         "Step 4: Send the <b>URL buttons</b>.\n\n"
         "<i>Use a new line for each row, and `|` to separate buttons on the same row.</i>\n\n"
         "<u>Example:</u>\n<code>Watch Now - https://... | Trailer - https://...</code>\n"
-        "<code>Our Website - https://...</code>",
+        "<code>Our Website - https://...</code>\n\nOr type <code>none</code> to skip.",
         parse_mode="HTML", disable_web_page_preview=True
     )
     return config.GET_BUTTONS
 
 async def get_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['broadcast_buttons_raw'] = update.message.text
-    await update.message.reply_text("Step 5: Send up to 3 <b>reaction emojis</b>, separated by spaces (e.g., 👍 ❤️ 😂). Or type 'none'.")
+    await update.message.reply_text("Step 5: Send up to 3 <b>reaction emojis</b>, separated by spaces (e.g., 👍 ❤️ 😂). Or type <code>none</code> to skip.", parse_mode="HTML")
     return config.GET_REACTIONS
 
 async def get_reactions_and_choose_target(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection):
@@ -175,6 +190,7 @@ async def get_reactions_and_choose_target(update: Update, context: ContextTypes.
     await update.message.reply_text("Final Step: Choose a target:", reply_markup=InlineKeyboardMarkup(keyboard))
     return config.CHOOSE_TARGET
 
+# --- THIS IS THE CORRECTED FUNCTION ---
 async def handle_target_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection, broadcasts_collection):
     query = update.callback_query
     message = update.message
@@ -187,10 +203,12 @@ async def handle_target_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             return config.CHOOSE_TARGET
         else:
             target_chat_id = query.data.split("_", 1)[1]
-            await query.edit_message_text(f"Sending to `{target_chat_id}`...", parse_mode="MarkdownV2")
+            # Use HTML parse mode to avoid MarkdownV2 errors with '.'
+            await query.edit_message_text(f"Sending to <code>{target_chat_id}</code>...", parse_mode="HTML")
     elif message:
         target_chat_id = message.text.strip()
-        await message.reply_text(f"Sending to `{target_chat_id}`...", parse_mode="MarkdownV2")
+        # Use HTML parse mode here as well for consistency
+        await message.reply_text(f"Sending to <code>{target_chat_id}</code>...", parse_mode="HTML")
 
     if target_chat_id:
         await send_broadcast(update, context, target_chat_id, user_collection, broadcasts_collection)
@@ -199,11 +217,14 @@ async def handle_target_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     return config.CHOOSE_TARGET
 
 async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, target_chat_id, user_collection, broadcasts_collection):
+    effective_chat_id = update.effective_chat.id
+    
     is_ok, error_message = await check_bot_permissions(context, target_chat_id)
     if not is_ok:
-        await context.bot.send_message(update.effective_chat.id, f"❌ Broadcast failed: {error_message}")
+        await context.bot.send_message(effective_chat_id, f"❌ Broadcast failed: {error_message}")
         context.user_data.clear()
         return ConversationHandler.END
+        
     try:
         reactions_raw = context.user_data.get('broadcast_reactions_raw', '')
         reaction_emojis = reactions_raw.strip().split()[:3] if reactions_raw.lower().strip() != 'none' else []
@@ -238,11 +259,11 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         )
         
         broadcasts_collection.update_one({"_id": broadcast_id}, {"$set": {"telegram_message_id": sent_message.message_id}})
-        await context.bot.send_message(update.effective_chat.id, "✅ Broadcast sent!")
+        await context.bot.send_message(effective_chat_id, "✅ Broadcast sent!")
     
     except Exception as e:
-        logger.error(f"Error in send_broadcast: {e}")
-        await context.bot.send_message(update.effective_chat.id, f"❌ Broadcast failed with an unexpected error: {e}")
+        logger.error(f"Error in send_broadcast for chat {target_chat_id}: {e}")
+        await context.bot.send_message(effective_chat_id, f"❌ Broadcast failed with an unexpected error: {e}")
     
     finally:
         context.user_data.clear()
