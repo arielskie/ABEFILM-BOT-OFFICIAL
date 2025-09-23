@@ -82,15 +82,17 @@ async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['broadcast_photo'] = update.message.photo[-1].file_id
-    await update.message.reply_text("Step 2: Send the <b>title</b>. HTML is supported.", parse_mode="HTML")
+    await update.message.reply_text("Step 2: Send the <b>title</b>. HTML formatting is supported.", parse_mode="HTML")
     return config.GET_TITLE
 
 async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This MUST use .text_html to preserve formatting from the user
     context.user_data['broadcast_title'] = update.message.text_html 
-    await update.message.reply_text("Step 3: Send the <b>description</b>. HTML is supported.", parse_mode="HTML")
+    await update.message.reply_text("Step 3: Send the <b>description</b>. HTML formatting is supported.", parse_mode="HTML")
     return config.GET_DESCRIPTION
 
 async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This MUST use .text_html to preserve formatting from the user
     context.user_data['broadcast_description'] = update.message.text_html
     await update.message.reply_text(
         "Step 4: Send the <b>URL buttons</b>.\n\n"
@@ -170,6 +172,7 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         final_keyboard_list = build_keyboard(doc_with_id)
         reply_markup = InlineKeyboardMarkup(final_keyboard_list) if final_keyboard_list else None
         
+        # THIS IS THE FINAL FIX: Simply combine the user-provided formatted title and description.
         caption = f"{broadcast_doc['title']}\n\n{broadcast_doc['description']}"
         
         if len(caption) > 1024:
