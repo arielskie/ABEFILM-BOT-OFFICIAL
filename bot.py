@@ -625,7 +625,7 @@ def main():
             config.GET_REACTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, partial(broadcast.get_reactions_and_choose_target, user_collection=user_collection))],
             config.CHOOSE_TARGET: [
                 CallbackQueryHandler(partial(broadcast.handle_target_choice, user_collection=user_collection, broadcasts_collection=broadcasts_collection), pattern=r"^bcast_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, partial(broadcast.send_broadcast, user_collection=user_collection, broadcasts_collection=broadcasts_collection))
+                MessageHandler(filters.TEXT & ~filters.COMMAND, partial(broadcast.handle_target_choice, user_collection=user_collection, broadcasts_collection=broadcasts_collection))
             ]
         },
         fallbacks=[cancel_handler],
