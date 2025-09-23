@@ -10,10 +10,11 @@ from telegram.error import BadRequest
 from telegram.constants import ChatType
 
 import config
-from search import get_details, get_best_backdrop_path, get_content_rating
 
 # --- Setup Logging ---
 logger = logging.getLogger(__name__)
+
+# --- Helper Functions for the Broadcast Command ---
 
 def build_keyboard(doc):
     final_keyboard = []
@@ -70,7 +71,7 @@ async def check_bot_permissions(context: ContextTypes.DEFAULT_TYPE, chat_id):
         logger.error(f"Unexpected error in check_bot_permissions for chat {chat_id}: {e}")
         return False, f"An unexpected error occurred: {e}"
 
-# --- Broadcast Handlers ---
+# --- Broadcast Conversation Handlers ---
 
 async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.type != 'private':
@@ -138,7 +139,6 @@ async def handle_target_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         
     return config.CHOOSE_TARGET
 
-# --- THIS IS THE CORRECTED FUNCTION ---
 async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, target_chat_id, user_collection, broadcasts_collection):
     effective_chat_id = update.effective_chat.id
     
@@ -170,7 +170,6 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         final_keyboard_list = build_keyboard(doc_with_id)
         reply_markup = InlineKeyboardMarkup(final_keyboard_list) if final_keyboard_list else None
         
-        # CORRECTED: This now simply combines the formatted title and description
         caption = f"{broadcast_doc['title']}\n\n{broadcast_doc['description']}"
         
         if len(caption) > 1024:
