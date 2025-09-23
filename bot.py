@@ -168,7 +168,6 @@ async def request_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("To make a request, please use the /request command inside a configured group.")
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Replies with the chat ID of the current chat OR the forwarded chat."""
     message = update.effective_message
     
     forward_chat = None
@@ -190,7 +189,7 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         await message.reply_text(f"This chat's ID is: <code>{chat_id}</code>", parse_mode="HTML")
 
-# --- UNIFIED GROUP MANAGEMENT ---
+# --- GROUP MANAGEMENT ---
 async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.type != 'private': await update.message.reply_text(PRIVATE_CHAT_ONLY_MESSAGE); return ConversationHandler.END
     keyboard = [[InlineKeyboardButton("📢 For My Broadcasts", callback_data="add_broadcast")], [InlineKeyboardButton("📝 For User Requests", callback_data="add_request")]]
@@ -225,8 +224,8 @@ async def get_chat_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> t
             chat_id = int(message.text.strip())
             chat = await context.bot.get_chat(chat_id)
             chat_title = chat.title
-        except ValueError:
-            await message.reply_text("That is not a valid numeric ID.")
+        except (ValueError, BadRequest):
+            await message.reply_text("That is not a valid numeric ID or I can't access it.")
             return None, None
         except Exception as e:
             await message.reply_text(f"Could not get info for that ID. Error: {e}")
@@ -305,7 +304,7 @@ async def handle_delete_group_selection(update: Update, context: ContextTypes.DE
     else: await query.edit_message_text("An unknown error occurred.")
     return ConversationHandler.END
 
-# --- UNIFIED SOURCE MANAGEMENT ---
+# --- SOURCE MANAGEMENT ---
 async def _get_server_management_keyboard(user_id: int) -> InlineKeyboardMarkup:
     user_doc = user_collection.find_one({"user_id": user_id})
     custom_sources = user_doc.get("sources", []) if user_doc else []
@@ -593,11 +592,53 @@ async def handle_copy_details(update: Update, context: ContextTypes.DEFAULT_TYPE
     if caption_text: await query.answer(text=caption_text[:199], show_alert=True)
     else: await query.answer("No details to copy.", show_alert=True)
 
+# --- NEW REACTION HANDLER ---
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        _, broadcast_id_str, emoji = query.data.split('_', 2)
+        broadcast_id = ObjectId(broadcast_id_str)
+        user_id = str(query.from_user.id)
+    except (ValueError, IndexError):
+        await query.answer("Invalid reaction data.", show_alert=True)
+        return
+
+    broadcast_doc = broadcasts_collection.find_one({"_id": broadcast_id})
+    if not broadcast_doc:
+        await query.answer("This post is no longer available for reactions.", show_alert=True)
+        return
+
+    reactions = broadcast_doc.get("reactions", {})
+    user_reaction_key = f"reactions.{user_id}"
+
+    # Toggle logic: if user clicks the same emoji, remove their reaction. Otherwise, add/update it.
+    if reactions.get(user_id) == emoji:
+        broadcasts_collection.update_one({"_id": broadcast_id}, {"$unset": {user_reaction_key: ""}})
+        await query.answer("Reaction removed.")
+    else:
+        broadcasts_collection.update_one({"_id": broadcast_id}, {"$set": {user_reaction_key: emoji}})
+        await query.answer("Reaction added!")
+
+    # Update the keyboard with new counts
+    updated_doc = broadcasts_collection.find_one({"_id": broadcast_id})
+    new_keyboard_list = broadcast.build_keyboard(updated_doc)
+    reply_markup = InlineKeyboardMarkup(new_keyboard_list) if new_keyboard_list else None
+    
+    try:
+        await query.edit_message_reply_markup(reply_markup=reply_markup)
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            # This is okay, just means two people clicked at the same time and the state is already updated.
+            pass
+        else:
+            logger.error(f"Error updating reaction keyboard: {e}")
+
 async def unified_callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.data == 'ignore':
         await query.answer("This is a status indicator.")
         return
+    # This is the catch-all for buttons that don't have a specific handler
     await query.answer("This button is for display or is handled elsewhere.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -722,28 +763,30 @@ def main():
     app.add_handler(gencode_conv)
     app.add_handler(my_server_conv)
 
-    # Callback Query Handlers
-    app.add_handler(CallbackQueryHandler(search_button_handler, pattern=r"^(select_|next_page|prev_page)")); 
-    app.add_handler(CallbackQueryHandler(handle_season_selection, pattern=r"^seasonselect_")); 
-    app.add_handler(CallbackQueryHandler(handle_trailer, pattern=r"^trailer_")); 
-    app.add_handler(CallbackQueryHandler(handle_copy_details, pattern=r"^copy_details_")); 
-    app.add_handler(CallbackQueryHandler(request.handle_request_tracking, pattern=r"^req_track\|")); 
-    app.add_handler(CallbackQueryHandler(unified_callback_query_handler, pattern=r"^react_"))
+    # --- THIS SECTION IS NOW CORRECTED ---
+    # Specific Callback Query Handlers
+    app.add_handler(CallbackQueryHandler(search_button_handler, pattern=r"^(select_|next_page|prev_page)"))
+    app.add_handler(CallbackQueryHandler(handle_season_selection, pattern=r"^seasonselect_"))
+    app.add_handler(CallbackQueryHandler(handle_trailer, pattern=r"^trailer_"))
+    app.add_handler(CallbackQueryHandler(handle_copy_details, pattern=r"^copy_details_"))
+    app.add_handler(CallbackQueryHandler(request.handle_request_tracking, pattern=r"^req_track\|"))
+    # The new, correct handler for reactions
+    app.add_handler(CallbackQueryHandler(handle_reaction, pattern=r"^react_"))
     
     # Command Handlers
-    app.add_handler(CommandHandler("request", partial(request.request_command_in_group, group_configs_collection=group_configs_collection), filters=filters.ChatType.GROUPS));
-    app.add_handler(CommandHandler("request", request_in_private, filters=filters.ChatType.PRIVATE));
-    app.add_handler(CommandHandler("start", start, filters=~filters.Regex(r'\/start request_'))); 
-    app.add_handler(CommandHandler("help", help_command)); 
-    app.add_handler(CommandHandler("search", search.search_command)); 
-    app.add_handler(CommandHandler("mygroups", my_groups)); 
+    app.add_handler(CommandHandler("request", partial(request.request_command_in_group, group_configs_collection=group_configs_collection), filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("request", request_in_private, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("start", start, filters=~filters.Regex(r'\/start request_')))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("search", search.search_command))
+    app.add_handler(CommandHandler("mygroups", my_groups))
     app.add_handler(CommandHandler("getid", get_id))
     
     # Other Handlers
-    app.add_handler(InlineQueryHandler(search.inline_query_handler)); 
+    app.add_handler(InlineQueryHandler(search.inline_query_handler))
     app.add_handler(MessageHandler(filters.Regex(r'^\/show_'), search.show_from_inline))
     
-    # Generic callback handler (must be last)
+    # Generic callback handler (must be last) for any buttons that don't have a specific handler
     app.add_handler(CallbackQueryHandler(unified_callback_query_handler))
 
     print("🚀 Bot is running...")
