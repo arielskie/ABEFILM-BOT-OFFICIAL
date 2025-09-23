@@ -29,7 +29,7 @@ from telegram.constants import ChatType
 import config
 import search
 import request
-import broadcast # <-- ADDED IMPORT
+import broadcast
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -114,7 +114,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_photo(photo=config.DEFAULT_THUMBNAIL, caption=start_caption, parse_mode="HTML", reply_markup=reply_markup)
 
-# --- REPLACED HELP COMMAND ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.type != 'private':
         await update.message.reply_text("Please use the /help command in a private chat with me for a full guide.")
@@ -306,9 +305,8 @@ async def handle_delete_group_selection(update: Update, context: ContextTypes.DE
     else: await query.edit_message_text("An unknown error occurred.")
     return ConversationHandler.END
 
-# --- NEW UNIFIED SOURCE MANAGEMENT ---
+# --- UNIFIED SOURCE MANAGEMENT ---
 async def _get_server_management_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Helper function to generate the server management keyboard."""
     user_doc = user_collection.find_one({"user_id": user_id})
     custom_sources = user_doc.get("sources", []) if user_doc else []
     disabled_sources = user_doc.get("disabled_sources", []) if user_doc else []
@@ -553,6 +551,7 @@ async def gencode_generate_and_send(update: Update, context: ContextTypes.DEFAUL
     with io.BytesIO(labels_text.encode('utf-8')) as f: f.name = 'labels.txt'; await context.bot.send_document(chat_id=user_id, document=f)
     context.user_data.clear()
 
+# --- OTHER HANDLERS ---
 async def search_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data
     if data == "next_page":
@@ -613,8 +612,6 @@ def main():
     cancel_handler = CommandHandler("cancel", cancel)
     
     # --- Conversation Handlers ---
-    
-    # --- NEW BROADCAST CONVERSATION HANDLER ---
     broadcast_conv = ConversationHandler(
         entry_points=[CommandHandler("broadcast", broadcast.start_broadcast)],
         states={
@@ -631,7 +628,7 @@ def main():
         fallbacks=[cancel_handler],
         name="broadcast_conversation",
         persistent=True,
-        conversation_timeout=600  # 10 minutes
+        conversation_timeout=600
     )
 
     add_group_conv = ConversationHandler(
