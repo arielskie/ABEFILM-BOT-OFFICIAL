@@ -10,7 +10,7 @@ from telegram.error import BadRequest
 from telegram.constants import ChatType
 
 import config
-# NOTE: The faulty import from 'search' has been removed.
+from search import get_details, get_best_backdrop_path, get_content_rating
 
 # --- Setup Logging ---
 logger = logging.getLogger(__name__)
@@ -138,6 +138,7 @@ async def handle_target_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         
     return config.CHOOSE_TARGET
 
+# --- THIS IS THE CORRECTED FUNCTION ---
 async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, target_chat_id, user_collection, broadcasts_collection):
     effective_chat_id = update.effective_chat.id
     
@@ -169,6 +170,7 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         final_keyboard_list = build_keyboard(doc_with_id)
         reply_markup = InlineKeyboardMarkup(final_keyboard_list) if final_keyboard_list else None
         
+        # CORRECTED: This now simply combines the formatted title and description
         caption = f"{broadcast_doc['title']}\n\n{broadcast_doc['description']}"
         
         if len(caption) > 1024:
