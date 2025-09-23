@@ -1,5 +1,3 @@
-# broadcast.py
-
 import collections
 import io
 import json
@@ -20,7 +18,7 @@ def get_content_rating(tmdb_id, media_type):
             url = f"https://api.themoviedb.org/3/movie/{tmdb_id}/release_dates"
             response = requests.get(url, params={"api_key": config.TMDB_API_KEY}).json()
             for result in response.get("results", []):
-                if result.get("iso_3316_1") == "US": return result.get("release_dates", [{}])[0].get("certification")
+                if result.get("iso_3166_1") == "US": return result.get("release_dates", [{}])[0].get("certification")
         elif media_type == 'tv':
             url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/content_ratings"
             response = requests.get(url, params={"api_key": config.TMDB_API_KEY}).json()
@@ -163,7 +161,7 @@ async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['broadcast_buttons_raw'] = update.message.text
-    await update.message.reply_text("Step 5: Send up to 3 <b>reaction emojis</b>, separated by spaces (e.g., 👍 ❤️ 😂).")
+    await update.message.reply_text("Step 5: Send up to 3 <b>reaction emojis</b>, separated by spaces (e.g., 👍 ❤️ 😂). Or type 'none'.")
     return config.GET_REACTIONS
 
 async def get_reactions_and_choose_target(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection):
@@ -171,7 +169,7 @@ async def get_reactions_and_choose_target(update: Update, context: ContextTypes.
     user_db_data = user_collection.find_one({"user_id": update.effective_user.id})
     saved_groups = user_db_data.get("broadcast_groups", []) if user_db_data else []
     if not saved_groups:
-        await update.message.reply_text("Final Step: Send the target Chat ID (e.g., @yourchannel).")
+        await update.message.reply_text("Final Step: Send the target Chat ID (e.g., @yourchannel or -100...).")
         return config.CHOOSE_TARGET
     keyboard = [[InlineKeyboardButton(g['title'], callback_data=f"bcast_{g['id']}")] for g in saved_groups] + [[InlineKeyboardButton("➡️ Send to a different ID", callback_data="bcast_new")]]
     await update.message.reply_text("Final Step: Choose a target:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -179,154 +177,73 @@ async def get_reactions_and_choose_target(update: Update, context: ContextTypes.
 
 async def handle_target_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection, broadcasts_collection):
     query = update.callback_query
+    message = update.message
+    target_chat_id = None
+    
     if query:
         await query.answer()
-    target_chat_id = None
-    if query and query.data == "bcast_new":
-        await query.edit_message_text("Send new Chat ID.")
-        return config.CHOOSE_TARGET
-    elif query:
-        target_chat_id = query.data.split("_", 1)[1]
-        await query.edit_message_text(f"Sending to {target_chat_id}...")
-    else:
-        target_chat_id = update.message.text
+        if query.data == "bcast_new":
+            await query.edit_message_text("Please send the new Chat ID (e.g., @yourchannel or -100...).")
+            return config.CHOOSE_TARGET
+        else:
+            target_chat_id = query.data.split("_", 1)[1]
+            await query.edit_message_text(f"Sending to `{target_chat_id}`...", parse_mode="MarkdownV2")
+    elif message:
+        target_chat_id = message.text.strip()
+        await message.reply_text(f"Sending to `{target_chat_id}`...", parse_mode="MarkdownV2")
+
     if target_chat_id:
         await send_broadcast(update, context, target_chat_id, user_collection, broadcasts_collection)
         return ConversationHandler.END
+        
     return config.CHOOSE_TARGET
 
 async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, target_chat_id, user_collection, broadcasts_collection):
     is_ok, error_message = await check_bot_permissions(context, target_chat_id)
     if not is_ok:
         await context.bot.send_message(update.effective_chat.id, f"❌ Broadcast failed: {error_message}")
+        context.user_data.clear()
         return ConversationHandler.END
     try:
         reactions_raw = context.user_data.get('broadcast_reactions_raw', '')
         reaction_emojis = reactions_raw.strip().split()[:3] if reactions_raw.lower().strip() != 'none' else []
+        
         broadcast_doc = {
             "author_user_id": update.effective_user.id,
             "reactions": {},
             "reaction_emojis": reaction_emojis,
             "target_chat_id": target_chat_id,
-            **{k.replace('broadcast_', ''): v for k, v in context.user_data.items() if k.startswith('broadcast_')}
+            "title": context.user_data.get('broadcast_title'),
+            "description": context.user_data.get('broadcast_description'),
+            "photo": context.user_data.get('broadcast_photo'),
+            "buttons_raw": context.user_data.get('broadcast_buttons_raw')
         }
-        broadcast_id = broadcasts_collection.insert_one(broadcast_doc).inserted_id
-        final_keyboard = build_keyboard(broadcasts_collection.find_one({"_id": broadcast_id}))
+        
+        insert_result = broadcasts_collection.insert_one(broadcast_doc)
+        broadcast_id = insert_result.inserted_id
+        
+        doc_with_id = broadcasts_collection.find_one({"_id": broadcast_id})
+        
+        final_keyboard_list = build_keyboard(doc_with_id)
+        reply_markup = InlineKeyboardMarkup(final_keyboard_list) if final_keyboard_list else None
+        
         caption = f"<b>{broadcast_doc['title']}</b>\n\n{broadcast_doc['description']}"
+        
         sent_message = await context.bot.send_photo(
             chat_id=target_chat_id,
             photo=broadcast_doc['photo'],
             caption=caption,
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(final_keyboard) if final_keyboard else None
+            reply_markup=reply_markup
         )
+        
         broadcasts_collection.update_one({"_id": broadcast_id}, {"$set": {"telegram_message_id": sent_message.message_id}})
         await context.bot.send_message(update.effective_chat.id, "✅ Broadcast sent!")
-    except Exception as e:
-        await context.bot.send_message(update.effective_chat.id, f"❌ Broadcast failed with an unexpected error: {e}")
-    finally:
-        for k in list(context.user_data):
-            if k.startswith('broadcast_'):
-                del context.user_data[k]
-        return ConversationHandler.END
-
-# --- Source Management Handlers ---
-
-async def my_sources(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection, default_sources):
-    if update.message.chat.type != 'private':
-        await update.message.reply_text("This command can only be used in a private chat with me.")
-        return
-    user_data = user_collection.find_one({"user_id": update.effective_user.id})
-    user_sources = user_data.get("video_sources", []) if user_data else []
-    all_sources = default_sources + user_sources
-    message = "<b>Your Current Video Sources:</b>\n\n" + "\n".join([f"<b>{i}. {s['name']}</b>\n  - <i>Movie:</i> <code>{s['movie_url']}</code>\n  - <i>TV:</i> <code>{s['tv_url']}</code>\n" for i, s in enumerate(all_sources, 1)])
-    await update.message.reply_text(message, parse_mode="HTML")
-
-async def add_source_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != 'private':
-        await update.message.reply_text("This command can only be used in a private chat with me.")
-        return ConversationHandler.END
-    await update.message.reply_text("What is the name of the source (e.g., Vidsrc.to)?")
-    return config.GET_SOURCE_NAME
-
-async def get_source_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['source_name'] = update.message.text.strip()
-    await update.message.reply_text("Now send the URL template for **Movies**.\nUse <code>{tmdb_id}</code> as a placeholder.\nExample: <code>https://vidsrc.to/embed/movie/{tmdb_id}</code>", parse_mode="HTML")
-    return config.GET_MOVIE_URL
-
-async def get_movie_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['movie_url'] = update.message.text.strip()
-    await update.message.reply_text("Now send the URL template for **TV Shows**.\nUse <code>{tmdb_id}</code>, <code>{season}</code>, and <code>{episode}</code>.\nExample: <code>https://vidsrc.to/embed/tv/{tmdb_id}/{season}/{episode}</code>", parse_mode="HTML")
-    return config.GET_TV_URL
-
-async def save_tv_url_and_finish(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection):
-    new_source = {"name": context.user_data['source_name'], "movie_url": context.user_data['movie_url'], "tv_url": update.message.text.strip()}
-    user_collection.update_one({"user_id": update.effective_user.id}, {"$push": {"video_sources": new_source}}, upsert=True)
-    await update.message.reply_text(f"✅ Success! Source '{new_source['name']}' has been added.")
-    context.user_data.clear() 
-    return ConversationHandler.END
-
-async def delete_source_start(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection):
-    if update.message.chat.type != 'private':
-        await update.message.reply_text("This command can only be used in a private chat with me.")
-        return ConversationHandler.END
-    user_data = user_collection.find_one({"user_id": update.effective_user.id})
-    user_sources = user_data.get("video_sources") if user_data else None
-    if not user_sources:
-        await update.message.reply_text("You have no custom sources to delete.")
-        return ConversationHandler.END
-    buttons = [[InlineKeyboardButton(source['name'], callback_data=f"delsrc_{source['name']}")] for source in user_sources]
-    await update.message.reply_text("Which source would you like to delete? Use /cancel to stop.", reply_markup=InlineKeyboardMarkup(buttons))
-    return config.DELETING_SOURCE
-
-async def handle_delete_source_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection) -> int:
-    query = update.callback_query
-    await query.answer()
-    source_name_to_delete = query.data.split("_", 1)[1]
-    user_collection.update_one(
-        {"user_id": query.from_user.id},
-        {"$pull": {"video_sources": {"name": source_name_to_delete}}}
-    )
-    await query.edit_message_text(f"✅ Source '{source_name_to_delete}' has been deleted.")
-    return ConversationHandler.END
-
-async def reset_sources(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection):
-    if update.message.chat.type != 'private':
-        await update.message.reply_text("This command can only be used in a private chat with me.")
-        return
-    user_collection.update_one({"user_id": update.effective_user.id}, {"$set": {"video_sources": [], "toggled_sources": {}}})
-    await update.message.reply_text("✅ Your video sources have been reset to the defaults.")
-
-async def toggle_sources_start(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection, default_sources):
-    if update.message.chat.type != 'private':
-        await update.message.reply_text("This command can only be used in a private chat with me.")
-        return
-    user_id = update.effective_user.id
-    user_data = user_collection.find_one({"user_id": user_id}) or {}
-    user_sources = user_data.get("video_sources", [])
-    toggled_sources = user_data.get("toggled_sources", {})
-    all_sources = default_sources + user_sources
-    buttons = [[InlineKeyboardButton(f"{'✅' if toggled_sources.get(s['name'], True) else '❌'} {s['name']}", callback_data=f"togglesrc_{s['name']}")] for s in all_sources]
-    buttons.append([InlineKeyboardButton("Done", callback_data="togglesrc_done")])
-    await update.message.reply_text("Toggle your video sources for 'Generate Post Code'.", reply_markup=InlineKeyboardMarkup(buttons))
-    return config.TOGGLE_SOURCE
-
-async def handle_toggle_source(update: Update, context: ContextTypes.DEFAULT_TYPE, user_collection, default_sources):
-    query = update.callback_query
-    await query.answer()
-    source_name = query.data.split("_", 1)[1]
-    if source_name == "done":
-        await query.edit_message_text("✅ Source preferences saved.")
-        return ConversationHandler.END
     
-    user_id = query.from_user.id
-    user_data = user_collection.find_one({"user_id": user_id}) or {}
-    toggled = user_data.get("toggled_sources", {})
-    toggled[source_name] = not toggled.get(source_name, True)
-    user_collection.update_one({"user_id": user_id}, {"$set": {"toggled_sources": toggled}}, upsert=True)
-    user_sources = user_data.get("video_sources", [])
-    all_sources = default_sources + user_sources
-    buttons = [[InlineKeyboardButton(f"{'✅' if toggled.get(s['name'], True) else '❌'} {s['name']}", callback_data=f"togglesrc_{s['name']}")] for s in all_sources]
-    buttons.append([InlineKeyboardButton("Done", callback_data="togglesrc_done")])
-    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
-    return config.TOGGLE_SOURCE
+    except Exception as e:
+        logger.error(f"Error in send_broadcast: {e}")
+        await context.bot.send_message(update.effective_chat.id, f"❌ Broadcast failed with an unexpected error: {e}")
+    
+    finally:
+        context.user_data.clear()
+        return ConversationHandler.END
