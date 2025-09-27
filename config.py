@@ -3,6 +3,9 @@
 # --- Telegram Bot Configuration ---
 BOT_TOKEN = '8068977426:AAHc9P8o_dd99l2e798D4XDpNsN1KeaDxo8'
 
+# --- OWNER_GROUP ---
+OWNER_GROUP = '-1001817573310'
+
 # --- TMDB API Configuration ---
 TMDB_API_KEY = '8b23434c25286f8846655c6c6bfc7bf2'
 
