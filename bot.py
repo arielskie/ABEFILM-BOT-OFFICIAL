@@ -6,6 +6,7 @@ from bson.objectid import ObjectId
 from datetime import datetime
 from functools import partial
 import re
+import traceback ### --- NEW --- ### For detailed error logging
 
 from telegram import (
     Update,
@@ -76,6 +77,29 @@ async def is_user_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, u
     except Exception as e:
         print(f"Error checking admin status: {e}")
         return False
+
+### --- NEW --- ### HELPER: Checks if a user is in the owner's group
+try:
+    OWNER_GROUP_INT_ID = int(config.OWNER_GROUP)
+except (ValueError, TypeError):
+    logger.error("OWNER_GROUP ID in config is not a valid integer. Search restriction will not work.")
+    OWNER_GROUP_INT_ID = None
+
+async def is_member_of_owner_group(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not OWNER_GROUP_INT_ID:
+        return False # Fail safely if ID is not configured correctly
+    try:
+        member = await context.bot.get_chat_member(chat_id=OWNER_GROUP_INT_ID, user_id=user_id)
+        return member.status in ['creator', 'administrator', 'member', 'restricted']
+    except BadRequest as e:
+        if "user not found" in str(e).lower():
+            return False
+        logger.warning(f"Could not check membership for user {user_id} in group {OWNER_GROUP_INT_ID}: {e}")
+        return False # Assume not a member if there's an error
+    except Exception as e:
+        logger.error(f"Unexpected error checking membership for user {user_id}: {e}")
+        return False
+### --- END NEW --- ###
 
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -467,9 +491,17 @@ async def my_server_save_tv_url(update: Update, context: ContextTypes.DEFAULT_TY
 # --- GENCODE ---
 async def gencode_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # Check if user has started the bot, needed for private messaging
+    try:
+        await context.bot.send_chat_action(chat_id=query.from_user.id, action='typing')
+    except BadRequest:
+        await query.answer("Please start a private chat with me first before using this feature.", show_alert=True)
+        return ConversationHandler.END
+
     await query.answer("Please check your private messages with me to continue.", show_alert=True)
     try: await query.message.delete()
     except Exception: pass
+
     try:
         parts = query.data.split("_")
         tmdb_id, media_type = parts[1], parts[2]
@@ -484,8 +516,6 @@ async def gencode_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['gencode_info'] = {"tmdb_id": tmdb_id, "media_type": media_type}
             await context.bot.send_message(chat_id=query.from_user.id, text="Generating code for a TV show.\nPlease enter the Season Number (press Enter for default: 1).")
             return config.AWAITING_SEASON_CHOICE
-    except BadRequest:
-        await context.bot.send_message(chat_id=query.message.chat.id, text=f"{query.from_user.mention_html()}, I can't send you a private message. Please start a chat with me first and try again.", parse_mode="HTML"); return ConversationHandler.END
     except Exception as e:
         logger.error(f"Error in gencode_start: {e}"); return ConversationHandler.END
 
@@ -500,55 +530,83 @@ async def gencode_handle_season_choice(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("An error occurred. Please try generating the code again.")
         return ConversationHandler.END
     await gencode_generate_and_send(update, context, gencode_info['tmdb_id'], gencode_info['media_type'], season)
+    context.user_data.clear()
     return ConversationHandler.END
 
+### --- MODIFIED: Added robust error handling to prevent getting stuck --- ###
 async def gencode_generate_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, tmdb_id: str, media_type: str, season: int = 1):
     user_id = update.effective_user.id
-    await context.bot.send_message(chat_id=user_id, text="⏳ Generating code, please wait...")
-    details, credits = search.get_details(tmdb_id, media_type)
-    extra_details = search.get_extra_details_for_labels(tmdb_id, media_type)
-    year = (details.get('release_date') or details.get('first_air_date') or '')[:4]
-    season_details = {}
-    if media_type == 'tv':
-        media_type_label = 'TV Series'; season_details = search.get_season_details(tmdb_id, season)
-        if season_details.get('air_date'): year = season_details['air_date'][:4]
-    else: media_type_label = 'Movie'
-    labels = [media_type_label]
-    labels.extend([g['name'] for g in details.get('genres', [])])
-    if extra_details.get('rating'): labels.append(f"z{extra_details['rating']}")
-    if year: labels.append(f"zYear:{year}")
-    if media_type == 'movie' and details.get('runtime'): labels.append(f"zDuration:{details.get('runtime')}min")
-    elif media_type == 'tv' and details.get('episode_run_time'):
-        if details.get('episode_run_time'): labels.append(f"zDuration:{details['episode_run_time'][0]}min")
-    if details.get('status') == 'Returning Series': labels.append('zOngoing')
-    elif details.get('status') == 'Ended': labels.append('zEnded')
-    if details.get("production_countries"): labels.append(f"zCountry:{details.get('production_countries')[0]['iso_3166_1']}")
-    labels_text = ",".join(labels)
-    user_sources_doc = user_collection.find_one({"user_id": user_id})
-    all_possible_sources = list(DEFAULT_SOURCES)
-    if user_sources_doc and "sources" in user_sources_doc:
-        all_possible_sources.extend(user_sources_doc.get("sources", []))
-    disabled_source_names = user_sources_doc.get("disabled_sources", []) if user_sources_doc else []
-    sources_to_use = [source for source in all_possible_sources if source.get("name") not in disabled_source_names]
-    post_id = "5083835698040575230"; poster_url = f"https://image.tmdb.org/t/p/w500{details.get('poster_path', '')}"; overview = details.get('overview', ''); default_thumbnail = f"https://image.tmdb.org/t/p/original{details.get('backdrop_path', '')}"
-    celebrities = [{"name": c.get('name'), "photo": f"https://image.tmdb.org/t/p/w185{c.get('profile_path')}" if c.get('profile_path') else "", "title": c.get('character')} for c in credits.get('cast', [])[:10]]
-    episodes_list, downloads_list = [], []
-    if media_type == 'tv':
-        episodes_data = season_details.get('episodes', [])
-        if not episodes_data:
-            await context.bot.send_message(chat_id=user_id, text=f"⚠️ Could not find any episodes for Season {season}. Please check the season number on TMDB and try again."); context.user_data.clear(); return
-        for ep_data in episodes_data:
-            ep_num = ep_data['episode_number']
-            episodes_list.append({"episode": f"{ep_num:02d}", "thumb": "", "videos": {s['name']: s['tv_url'].format(tmdb_id=tmdb_id, season=season, episode=ep_num) for s in sources_to_use}})
-            downloads_list.append({"source": f"Vidsrc.vip Ep{ep_num}", "quality": "Multiquality", "size": "-", "url": f"https://dl.vidsrc.vip/tv/{tmdb_id}/{season}/{ep_num}"})
-    else: # Movie
-        episodes_list.append({"episode": "01", "thumb": "", "videos": {s['name']: s['movie_url'].format(tmdb_id=tmdb_id) for s in sources_to_use}})
-        downloads_list.append({"source": "Vidsrc.vip Movie", "quality": "Multiquality", "size": "-", "url": f"https://dl.vidsrc.vip/movie/{tmdb_id}"})
-    script_content = f"const defaultThumbnail = '{default_thumbnail}';\nconst episodes = {json.dumps(episodes_list, indent=2)};\nconst downloads = {json.dumps(downloads_list, indent=2)};\nconst celebrities = {json.dumps(celebrities, indent=2)};"
-    html_content = f'<div>\n <span id="post-id" data-post-id="{post_id}"></span>\n  <img alt="poster" src="{poster_url}" />\n  <iframe class="lazyloaded" data-src="/" src="/"></iframe>\n  <p>{overview}</p>\n  <script>\n    {script_content}\n  </script>\n</div>'
-    with io.BytesIO(html_content.encode('utf-8')) as f: f.name = 'post_code.txt'; await context.bot.send_document(chat_id=user_id, document=f)
-    with io.BytesIO(labels_text.encode('utf-8')) as f: f.name = 'labels.txt'; await context.bot.send_document(chat_id=user_id, document=f)
-    context.user_data.clear()
+    placeholder_message = await context.bot.send_message(chat_id=user_id, text="⏳ Generating code, please wait...")
+
+    try:
+        details, credits = search.get_details(tmdb_id, media_type)
+        if not details:
+            await placeholder_message.edit_text("❌ Could not find details for this item on TMDB. Please check the ID and try again.")
+            return
+
+        extra_details = search.get_extra_details_for_labels(tmdb_id, media_type)
+        year = (details.get('release_date') or details.get('first_air_date') or '')[:4]
+        season_details = {}
+        if media_type == 'tv':
+            media_type_label = 'TV Series'
+            season_details = search.get_season_details(tmdb_id, season)
+            if season_details.get('air_date'): year = season_details['air_date'][:4]
+        else: media_type_label = 'Movie'
+        labels = [media_type_label]
+        labels.extend([g['name'] for g in details.get('genres', [])])
+        if extra_details.get('rating'): labels.append(f"z{extra_details['rating']}")
+        if year: labels.append(f"zYear:{year}")
+        if media_type == 'movie' and details.get('runtime'): labels.append(f"zDuration:{details.get('runtime')}min")
+        elif media_type == 'tv' and details.get('episode_run_time'):
+            if details.get('episode_run_time'): labels.append(f"zDuration:{details['episode_run_time'][0]}min")
+        if details.get('status') == 'Returning Series': labels.append('zOngoing')
+        elif details.get('status') == 'Ended': labels.append('zEnded')
+        # Safer check for production_countries
+        if details.get("production_countries") and details["production_countries"]:
+            labels.append(f"zCountry:{details['production_countries'][0]['iso_3166_1']}")
+        
+        labels_text = ",".join(labels)
+        user_sources_doc = user_collection.find_one({"user_id": user_id})
+        all_possible_sources = list(DEFAULT_SOURCES)
+        if user_sources_doc and "sources" in user_sources_doc:
+            all_possible_sources.extend(user_sources_doc.get("sources", []))
+        disabled_source_names = user_sources_doc.get("disabled_sources", []) if user_sources_doc else []
+        sources_to_use = [source for source in all_possible_sources if source.get("name") not in disabled_source_names]
+        post_id = "5083835698040575230"
+        poster_url = f"https://image.tmdb.org/t/p/w500{details.get('poster_path', '')}"
+        overview = details.get('overview', '')
+        default_thumbnail = f"https://image.tmdb.org/t/p/original{details.get('backdrop_path', '')}"
+        celebrities = [{"name": c.get('name'), "photo": f"https://image.tmdb.org/t/p/w185{c.get('profile_path')}" if c.get('profile_path') else "", "title": c.get('character')} for c in credits.get('cast', [])[:10]]
+        episodes_list, downloads_list = [], []
+        
+        if media_type == 'tv':
+            episodes_data = season_details.get('episodes', [])
+            if not episodes_data:
+                await placeholder_message.edit_text(f"⚠️ Could not find any episodes for Season {season}. Please check the season number on TMDB and try again.")
+                return
+            for ep_data in episodes_data:
+                ep_num = ep_data['episode_number']
+                episodes_list.append({"episode": f"{ep_num:02d}", "thumb": "", "videos": {s['name']: s['tv_url'].format(tmdb_id=tmdb_id, season=season, episode=ep_num) for s in sources_to_use}})
+                downloads_list.append({"source": f"Vidsrc.vip Ep{ep_num}", "quality": "Multiquality", "size": "-", "url": f"https://dl.vidsrc.vip/tv/{tmdb_id}/{season}/{ep_num}"})
+        else: # Movie
+            episodes_list.append({"episode": "01", "thumb": "", "videos": {s['name']: s['movie_url'].format(tmdb_id=tmdb_id) for s in sources_to_use}})
+            downloads_list.append({"source": "Vidsrc.vip Movie", "quality": "Multiquality", "size": "-", "url": f"https://dl.vidsrc.vip/movie/{tmdb_id}"})
+            
+        script_content = f"const defaultThumbnail = '{default_thumbnail}';\nconst episodes = {json.dumps(episodes_list, indent=2)};\nconst downloads = {json.dumps(downloads_list, indent=2)};\nconst celebrities = {json.dumps(celebrities, indent=2)};"
+        html_content = f'<div>\n <span id="post-id" data-post-id="{post_id}"></span>\n  <img alt="poster" src="{poster_url}" />\n  <iframe class="lazyloaded" data-src="/" src="/"></iframe>\n  <p>{overview}</p>\n  <script>\n    {script_content}\n  </script>\n</div>'
+        
+        await placeholder_message.delete()
+        with io.BytesIO(html_content.encode('utf-8')) as f: f.name = 'post_code.txt'; await context.bot.send_document(chat_id=user_id, document=f)
+        with io.BytesIO(labels_text.encode('utf-8')) as f: f.name = 'labels.txt'; await context.bot.send_document(chat_id=user_id, document=f)
+    
+    except Exception as e:
+        logger.error(f"Failed to generate code for user {user_id} with tmdb_id {tmdb_id}: {e}")
+        traceback.print_exc()
+        try:
+            await placeholder_message.edit_text("❌ An unexpected error occurred while generating the code. Please try again later. The developer has been notified.")
+        except Exception as edit_e:
+            logger.error(f"Failed to edit error message: {edit_e}")
+### --- END MODIFIED SECTION --- ###
 
 # --- OTHER HANDLERS ---
 async def search_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -646,6 +704,25 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await message.reply_text("Action canceled.")
     context.user_data.clear()
     return ConversationHandler.END
+
+### --- NEW --- ### Wrapper functions for restricted search
+async def restricted_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_member_of_owner_group(update.effective_user.id, context):
+        await update.message.reply_text("Sorry, the search feature is restricted to authorized members only.")
+        return
+    await search.search_command(update, context)
+
+async def restricted_inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_member_of_owner_group(update.inline_query.from_user.id, context):
+        await update.inline_query.answer(
+            [],
+            cache_time=60,
+            switch_pm_text="This feature is restricted.",
+            switch_pm_parameter="start"
+        )
+        return
+    await search.inline_query_handler(update, context)
+### --- END NEW --- ###
 
 def main():
     persistence = PicklePersistence(filepath="bot_persistence")
@@ -763,14 +840,12 @@ def main():
     app.add_handler(gencode_conv)
     app.add_handler(my_server_conv)
 
-    # --- THIS SECTION IS NOW CORRECTED ---
     # Specific Callback Query Handlers
     app.add_handler(CallbackQueryHandler(search_button_handler, pattern=r"^(select_|next_page|prev_page)"))
     app.add_handler(CallbackQueryHandler(handle_season_selection, pattern=r"^seasonselect_"))
     app.add_handler(CallbackQueryHandler(handle_trailer, pattern=r"^trailer_"))
     app.add_handler(CallbackQueryHandler(handle_copy_details, pattern=r"^copy_details_"))
     app.add_handler(CallbackQueryHandler(request.handle_request_tracking, pattern=r"^req_track\|"))
-    # The new, correct handler for reactions
     app.add_handler(CallbackQueryHandler(handle_reaction, pattern=r"^react_"))
     
     # Command Handlers
@@ -778,15 +853,20 @@ def main():
     app.add_handler(CommandHandler("request", request_in_private, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("start", start, filters=~filters.Regex(r'\/start request_')))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("search", search.search_command))
+    
+    ### --- MODIFIED: Using the new restricted search handler --- ###
+    app.add_handler(CommandHandler("search", restricted_search_command))
+    
     app.add_handler(CommandHandler("mygroups", my_groups))
     app.add_handler(CommandHandler("getid", get_id))
     
     # Other Handlers
-    app.add_handler(InlineQueryHandler(search.inline_query_handler))
+    ### --- MODIFIED: Using the new restricted inline handler --- ###
+    app.add_handler(InlineQueryHandler(restricted_inline_query_handler))
+    
     app.add_handler(MessageHandler(filters.Regex(r'^\/show_'), search.show_from_inline))
     
-    # Generic callback handler (must be last) for any buttons that don't have a specific handler
+    # Generic callback handler (must be last)
     app.add_handler(CallbackQueryHandler(unified_callback_query_handler))
 
     print("🚀 Bot is running...")
