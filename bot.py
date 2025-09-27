@@ -6,7 +6,7 @@ from bson.objectid import ObjectId
 from datetime import datetime
 from functools import partial
 import re
-import traceback ### --- NEW --- ### For detailed error logging
+import traceback
 
 from telegram import (
     Update,
@@ -58,12 +58,12 @@ except Exception as e:
     print(f"❌ FATAL: Could not connect to MongoDB: {e}")
     exit()
 
-# --- Default Video Sources ---
+### --- FIXED: The URL for Vidlink.pro movie was incorrect. --- ###
 DEFAULT_SOURCES = [
     {"name": "Vidsrc.to", "movie_url": "https://vidsrc.to/embed/movie/{tmdb_id}", "tv_url": "https://vidsrc.to/embed/tv/{tmdb_id}/{season}/{episode}"},
     {"name": "Vidsrc.co", "movie_url": "https://player.vidsrc.co/embed/movie/{tmdb_id}", "tv_url": "https://player.vidsrc.co/embed/tv/{tmdb_id}/{season}/{episode}"},
     {"name": "Vidsrc.vip", "movie_url": "https://vidsrc.vip/embed/movie/{tmdb_id}", "tv_url": "https://vidsrc.vip/embed/tv/{tmdb_id}/{season}/{episode}"},
-    {"name": "Vidlink.pro", "movie_url": "https://vidlink.pro/tv/{tmdb_id}/{season}/{episode}", "tv_url": "https://vidlink.pro/tv/{tmdb_id}/{season}/{episode}"},
+    {"name": "Vidlink.pro", "movie_url": "https://vidlink.pro/embed/movie/{tmdb_id}", "tv_url": "https://vidlink.pro/tv/{tmdb_id}/{season}/{episode}"},
     {"name": "Autoembed.pro", "movie_url": "https://autoembed.pro/embed/movie/{tmdb_id}", "tv_url": "https://autoembed.pro/embed/tv/{tmdb_id}/{season}/{episode}"},
     {"name": "Vidapi.xyz", "movie_url": "https://vidapi.xyz/embed/movie/{tmdb_id}", "tv_url": "https://vidapi.xyz/embed/tv/{tmdb_id}&s={season}&e={episode}"},
     {"name": "Vidpop.xyz", "movie_url": "https://www.vidpop.xyz/embed/?id={tmdb_id}", "tv_url": "https://www.vidpop.xyz/embed/?id={tmdb_id}&season={season}&episode={episode}"}
@@ -78,7 +78,7 @@ async def is_user_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, u
         print(f"Error checking admin status: {e}")
         return False
 
-### --- NEW --- ### HELPER: Checks if a user is in the owner's group
+# --- HELPER: Checks if a user is in the owner's group ---
 try:
     OWNER_GROUP_INT_ID = int(config.OWNER_GROUP)
 except (ValueError, TypeError):
@@ -99,7 +99,6 @@ async def is_member_of_owner_group(user_id: int, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.error(f"Unexpected error checking membership for user {user_id}: {e}")
         return False
-### --- END NEW --- ###
 
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -491,7 +490,6 @@ async def my_server_save_tv_url(update: Update, context: ContextTypes.DEFAULT_TY
 # --- GENCODE ---
 async def gencode_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # Check if user has started the bot, needed for private messaging
     try:
         await context.bot.send_chat_action(chat_id=query.from_user.id, action='typing')
     except BadRequest:
@@ -501,7 +499,6 @@ async def gencode_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Please check your private messages with me to continue.", show_alert=True)
     try: await query.message.delete()
     except Exception: pass
-
     try:
         parts = query.data.split("_")
         tmdb_id, media_type = parts[1], parts[2]
@@ -533,7 +530,6 @@ async def gencode_handle_season_choice(update: Update, context: ContextTypes.DEF
     context.user_data.clear()
     return ConversationHandler.END
 
-### --- MODIFIED: Added robust error handling to prevent getting stuck --- ###
 async def gencode_generate_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, tmdb_id: str, media_type: str, season: int = 1):
     user_id = update.effective_user.id
     placeholder_message = await context.bot.send_message(chat_id=user_id, text="⏳ Generating code, please wait...")
@@ -548,8 +544,7 @@ async def gencode_generate_and_send(update: Update, context: ContextTypes.DEFAUL
         year = (details.get('release_date') or details.get('first_air_date') or '')[:4]
         season_details = {}
         if media_type == 'tv':
-            media_type_label = 'TV Series'
-            season_details = search.get_season_details(tmdb_id, season)
+            media_type_label = 'TV Series'; season_details = search.get_season_details(tmdb_id, season)
             if season_details.get('air_date'): year = season_details['air_date'][:4]
         else: media_type_label = 'Movie'
         labels = [media_type_label]
@@ -561,7 +556,6 @@ async def gencode_generate_and_send(update: Update, context: ContextTypes.DEFAUL
             if details.get('episode_run_time'): labels.append(f"zDuration:{details['episode_run_time'][0]}min")
         if details.get('status') == 'Returning Series': labels.append('zOngoing')
         elif details.get('status') == 'Ended': labels.append('zEnded')
-        # Safer check for production_countries
         if details.get("production_countries") and details["production_countries"]:
             labels.append(f"zCountry:{details['production_countries'][0]['iso_3166_1']}")
         
@@ -572,18 +566,14 @@ async def gencode_generate_and_send(update: Update, context: ContextTypes.DEFAUL
             all_possible_sources.extend(user_sources_doc.get("sources", []))
         disabled_source_names = user_sources_doc.get("disabled_sources", []) if user_sources_doc else []
         sources_to_use = [source for source in all_possible_sources if source.get("name") not in disabled_source_names]
-        post_id = "5083835698040575230"
-        poster_url = f"https://image.tmdb.org/t/p/w500{details.get('poster_path', '')}"
-        overview = details.get('overview', '')
-        default_thumbnail = f"https://image.tmdb.org/t/p/original{details.get('backdrop_path', '')}"
+        post_id = "5083835698040575230"; poster_url = f"https://image.tmdb.org/t/p/w500{details.get('poster_path', '')}"; overview = details.get('overview', ''); default_thumbnail = f"https://image.tmdb.org/t/p/original{details.get('backdrop_path', '')}"
         celebrities = [{"name": c.get('name'), "photo": f"https://image.tmdb.org/t/p/w185{c.get('profile_path')}" if c.get('profile_path') else "", "title": c.get('character')} for c in credits.get('cast', [])[:10]]
         episodes_list, downloads_list = [], []
         
         if media_type == 'tv':
             episodes_data = season_details.get('episodes', [])
             if not episodes_data:
-                await placeholder_message.edit_text(f"⚠️ Could not find any episodes for Season {season}. Please check the season number on TMDB and try again.")
-                return
+                await placeholder_message.edit_text(f"⚠️ Could not find any episodes for Season {season}. Please check the season number on TMDB and try again."); return
             for ep_data in episodes_data:
                 ep_num = ep_data['episode_number']
                 episodes_list.append({"episode": f"{ep_num:02d}", "thumb": "", "videos": {s['name']: s['tv_url'].format(tmdb_id=tmdb_id, season=season, episode=ep_num) for s in sources_to_use}})
@@ -606,7 +596,6 @@ async def gencode_generate_and_send(update: Update, context: ContextTypes.DEFAUL
             await placeholder_message.edit_text("❌ An unexpected error occurred while generating the code. Please try again later. The developer has been notified.")
         except Exception as edit_e:
             logger.error(f"Failed to edit error message: {edit_e}")
-### --- END MODIFIED SECTION --- ###
 
 # --- OTHER HANDLERS ---
 async def search_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -650,7 +639,6 @@ async def handle_copy_details(update: Update, context: ContextTypes.DEFAULT_TYPE
     if caption_text: await query.answer(text=caption_text[:199], show_alert=True)
     else: await query.answer("No details to copy.", show_alert=True)
 
-# --- NEW REACTION HANDLER ---
 async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -669,7 +657,6 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reactions = broadcast_doc.get("reactions", {})
     user_reaction_key = f"reactions.{user_id}"
 
-    # Toggle logic: if user clicks the same emoji, remove their reaction. Otherwise, add/update it.
     if reactions.get(user_id) == emoji:
         broadcasts_collection.update_one({"_id": broadcast_id}, {"$unset": {user_reaction_key: ""}})
         await query.answer("Reaction removed.")
@@ -677,7 +664,6 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         broadcasts_collection.update_one({"_id": broadcast_id}, {"$set": {user_reaction_key: emoji}})
         await query.answer("Reaction added!")
 
-    # Update the keyboard with new counts
     updated_doc = broadcasts_collection.find_one({"_id": broadcast_id})
     new_keyboard_list = broadcast.build_keyboard(updated_doc)
     reply_markup = InlineKeyboardMarkup(new_keyboard_list) if new_keyboard_list else None
@@ -686,7 +672,6 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=reply_markup)
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
-            # This is okay, just means two people clicked at the same time and the state is already updated.
             pass
         else:
             logger.error(f"Error updating reaction keyboard: {e}")
@@ -696,7 +681,6 @@ async def unified_callback_query_handler(update: Update, context: ContextTypes.D
     if query.data == 'ignore':
         await query.answer("This is a status indicator.")
         return
-    # This is the catch-all for buttons that don't have a specific handler
     await query.answer("This button is for display or is handled elsewhere.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -705,24 +689,26 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-### --- NEW --- ### Wrapper functions for restricted search
+### --- NEW & FIXED --- ### Wrapper functions for restricted search
 async def restricted_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_member_of_owner_group(update.effective_user.id, context):
-        await update.message.reply_text("Sorry, the search feature is restricted to authorized members only.")
+    # Restrict /search to ONLY be used inside the owner's group
+    if str(update.effective_chat.id) != config.OWNER_GROUP:
+        await update.message.reply_text("This command can only be used in the authorized group.")
         return
     await search.search_command(update, context)
 
 async def restricted_inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Restrict inline search to MEMBERS of the owner's group
     if not await is_member_of_owner_group(update.inline_query.from_user.id, context):
         await update.inline_query.answer(
             [],
             cache_time=60,
-            switch_pm_text="This feature is restricted.",
+            switch_pm_text="This feature is restricted to group members.",
             switch_pm_parameter="start"
         )
         return
     await search.inline_query_handler(update, context)
-### --- END NEW --- ###
+### --- END NEW & FIXED --- ###
 
 def main():
     persistence = PicklePersistence(filepath="bot_persistence")
@@ -853,20 +839,17 @@ def main():
     app.add_handler(CommandHandler("request", request_in_private, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("start", start, filters=~filters.Regex(r'\/start request_')))
     app.add_handler(CommandHandler("help", help_command))
-    
-    ### --- MODIFIED: Using the new restricted search handler --- ###
-    app.add_handler(CommandHandler("search", restricted_search_command))
-    
     app.add_handler(CommandHandler("mygroups", my_groups))
     app.add_handler(CommandHandler("getid", get_id))
     
-    # Other Handlers
-    ### --- MODIFIED: Using the new restricted inline handler --- ###
+    # --- Register the new restricted search handlers ---
+    app.add_handler(CommandHandler("search", restricted_search_command))
     app.add_handler(InlineQueryHandler(restricted_inline_query_handler))
     
+    # Other Handlers
     app.add_handler(MessageHandler(filters.Regex(r'^\/show_'), search.show_from_inline))
     
-    # Generic callback handler (must be last)
+    # Generic callback handler (must be last) for any buttons that don't have a specific handler
     app.add_handler(CallbackQueryHandler(unified_callback_query_handler))
 
     print("🚀 Bot is running...")
