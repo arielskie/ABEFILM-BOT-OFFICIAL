@@ -173,11 +173,31 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         ))
     await update.inline_query.answer(articles, cache_time=10)
 
+### --- MODIFIED --- ###
+# This function now checks where the inline result was clicked.
 async def show_from_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # --- NEW PERMISSION CHECK ---
+    # Only allow the result to be posted in the designated OWNER_GROUP
+    if str(update.effective_chat.id) != config.OWNER_GROUP:
+        try:
+            # First, delete the triggering command message (/show_...)
+            await update.message.delete()
+            # Then, inform the user they are in the wrong chat
+            await update.effective_chat.send_message(
+                text="ℹ️ Please select inline results only from within the authorized group.",
+            )
+        except BadRequest:
+            # Ignore if message is already gone or bot lacks delete permissions
+            pass 
+        return # Stop further execution of the function
+    # --- END PERMISSION CHECK ---
+    
     try:
         _, tmdb_id, media_type = update.message.text.split("_")
-        try: await update.message.delete()
-        except BadRequest: pass
+        try: 
+            await update.message.delete()
+        except BadRequest: 
+            pass
 
         if media_type == 'tv':
             details, _ = get_details(tmdb_id, 'tv')
@@ -204,6 +224,7 @@ async def show_from_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_details_display_new(update, context, tmdb_id, media_type)
     except Exception as e:
         print(f"Error in show_from_inline: {e}")
+### --- END MODIFIED SECTION --- ###
 
 async def send_details_display_new(update, context, tmdb_id, media_type, season_number=1):
     details, _ = get_details(tmdb_id, media_type)
