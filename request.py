@@ -1,6 +1,5 @@
-# request.py
-
 import logging
+import asyncio 
 from datetime import datetime
 import re
 import random
@@ -10,6 +9,15 @@ import config
 
 # --- Setup Logging ---
 logger = logging.getLogger(__name__)
+
+# --- Helper: Auto Delete Task ---
+async def delete_message_delayed(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 60):
+    """Waits for 'delay' seconds and then deletes the message."""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
 
 # --- Helper function to check for admin status ---
 async def is_user_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
@@ -32,13 +40,45 @@ def get_initial_buttons(request_id, is_concern=False):
 async def request_command_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_configs_collection):
     group_id = update.message.chat.id
     config_doc = group_configs_collection.find_one({"_id": group_id})
-    if not config_doc:
-        await update.message.reply_text("This group is not configured for requests. An admin must use /addgroup in a private chat with me first.")
-        return
+    
     bot_username = (await context.bot.get_me()).username
+
+    # 1. Delete the user's "/request" command immediately to keep chat clean
+    try:
+        await update.message.delete()
+    except Exception:
+        pass # Bot might not have delete permissions, ignore.
+
+    # Case 1: Group is NOT configured yet
+    if not config_doc:
+        safe_title = update.message.chat.title.replace(' ', '-')
+        deep_link = f"https://t.me/{bot_username}?start=configure_group_{group_id}_{safe_title}"
+        
+        keyboard = [[InlineKeyboardButton("⚙️ Configure Group (Admin Only)", url=deep_link)]]
+        
+        # FIX: Use send_message instead of reply_text
+        msg = await context.bot.send_message(
+            chat_id=group_id,
+            text="⚠️ This group is not configured for requests yet.\nAdmins, please click the button below to set up the request destination.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        # Auto-delete warning after 2 minutes (120s)
+        context.application.create_task(delete_message_delayed(context, group_id, msg.message_id, 120))
+        return
+
+    # Case 2: Group IS configured
     deep_link = f"https://t.me/{bot_username}?start=request_{group_id}"
     keyboard = [[InlineKeyboardButton("✅ Start a Request", url=deep_link)]]
-    await update.message.reply_text("Please click the button below to start your request in a private chat with me. This keeps the group clean!", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    # FIX: Use send_message instead of reply_text because the original message is gone
+    sent_msg = await context.bot.send_message(
+        chat_id=group_id,
+        text="Please click the button below to start your request in a private chat with me. This message will vanish in 1 minute!", 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    # Auto-delete the bot's button message after 60 seconds
+    context.application.create_task(delete_message_delayed(context, group_id, sent_msg.message_id, 60))
 
 async def start_request_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'source_group_id' not in context.user_data:
@@ -150,22 +190,34 @@ async def get_final_detail_and_send(update: Update, context: ContextTypes.DEFAUL
 
     source_group_id = user_data.get('source_group_id')
     config_doc = group_configs_collection.find_one({"_id": source_group_id})
+    
     if not config_doc or 'request_group_id' not in config_doc:
-        await update.message.reply_text("Error: Destination channel not found for this group. Please contact an admin."); 
+        await update.message.reply_text("Error: Destination channel not found for this group. Please contact an admin.")
         user_data.clear()
         return ConversationHandler.END
+        
     dest_chat_id = config_doc['request_group_id']
+    dest_thread_id = config_doc.get('request_thread_id')
     
     request_id = f"req_{user.id}_{update.message.message_id}"
     reply_markup = get_initial_buttons(request_id, is_concern)
 
     try:
-        await context.bot.send_photo(chat_id=dest_chat_id, photo=poster_id, caption=message_text, parse_mode="HTML", reply_markup=reply_markup)
+        await context.bot.send_photo(
+            chat_id=dest_chat_id, 
+            message_thread_id=dest_thread_id, 
+            photo=poster_id, 
+            caption=message_text, 
+            parse_mode="HTML", 
+            reply_markup=reply_markup
+        )
         await update.message.reply_text("✅ Your request has been successfully submitted!")
     except Exception as e:
         logger.error(f"Failed to send request to {dest_chat_id}: {e}")
         await update.message.reply_text("❌ There was an error sending your request.")
-    user_data.clear(); return ConversationHandler.END
+    
+    user_data.clear()
+    return ConversationHandler.END
 
 # --- Admin Reply Handlers ---
 
@@ -178,7 +230,8 @@ async def handle_request_tracking(update: Update, context: ContextTypes.DEFAULT_
         
     await query.answer()
     
-    _, status, request_id = query.data.split('|'); admin_user = query.from_user
+    _, status, request_id = query.data.split('|')
+    admin_user = query.from_user
     original_caption = query.message.caption_html
     base_text = re.split(r'\n---\n', original_caption)[0]
 
@@ -210,11 +263,11 @@ async def handle_request_tracking(update: Update, context: ContextTypes.DEFAULT_
         new_keyboard = [[InlineKeyboardButton("✅ Mark as Uploaded", callback_data=f"req_remark|uploaded|{request_id}")]]
         await query.edit_message_caption(caption=new_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(new_keyboard))
 
-# --- THIS IS THE CORRECTED FUNCTION ---
+# --- Admin Remark Conversation ---
+
 async def start_remark_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
-    # ADMIN-ONLY ACTION: Verify the user is an admin.
     if not await is_user_chat_admin(context, query.message.chat_id, query.from_user.id):
         await query.answer("This action is for admins only.", show_alert=True)
         return
@@ -233,9 +286,7 @@ async def start_remark_conversation(update: Update, context: ContextTypes.DEFAUL
               f"Send /cancel to abort.")
     
     try:
-        # First, show a pop-up alert to the admin in the channel.
         await query.answer("Check your private messages to add remarks.", show_alert=True)
-        # Then, send the private message with the prompt.
         await context.bot.send_message(chat_id=query.from_user.id, text=prompt, parse_mode="HTML")
     except error.Forbidden:
         await query.answer("Could not send you a PM. Please start a chat with me first and try again.", show_alert=True)
@@ -290,7 +341,6 @@ async def handle_admin_remark(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             user_id = int(context.user_data['request_id'].split('_')[1])
 
-            # --- Professional User Notification Logic ---
             title_match = re.search(r"<b>Title:</b>\s*(.*?)\n", original_caption, re.IGNORECASE)
             subject_match = re.search(r"<b>Subject:</b>\s*(.*?)\n", original_caption, re.IGNORECASE)
             request_item = ""
