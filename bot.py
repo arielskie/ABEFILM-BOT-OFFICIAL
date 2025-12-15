@@ -1,8 +1,19 @@
 import pymongo
+import io
 import logging
-from functools import partial
+import json
+import random
+import string
+import datetime
 from bson.objectid import ObjectId
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from functools import partial
+import re
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -11,17 +22,20 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ConversationHandler,
+    InlineQueryHandler,
     PicklePersistence,
 )
 from telegram.error import BadRequest
 from telegram.constants import ChatType
 
+# Supabase Client
+from supabase import create_client, Client
+
 import config
 import request
 import broadcast
 import admin
-import themes
-import licenses
+import themes  # Keep themes.py separate to keep code clean
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -33,8 +47,11 @@ logger = logging.getLogger(__name__)
 # --- Constants ---
 PRIVATE_CHAT_ONLY_MESSAGE = "This command can only be used in a private chat with me."
 NOT_ADMIN_MESSAGE = "⛔ You are not authorized to use this command."
+VIEWING_SERVERS, DELETING_SERVER_CHOICE = range(100, 102)
 
-# --- MongoDB Client Initialization ---
+# --- DATABASE INITIALIZATION ---
+
+# 1. MongoDB
 try:
     mongo_client = pymongo.MongoClient(config.MONGO_URI)
     db = mongo_client[config.DB_NAME]
@@ -47,7 +64,28 @@ except Exception as e:
     print(f"❌ FATAL: Could not connect to MongoDB: {e}")
     exit()
 
-# --- HELPER: Checks if a user is an admin in a chat ---
+# 2. Supabase - License DB (Project A)
+try:
+    supabase_lic: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+    print("✅ Supabase (Licenses) Connected.")
+except Exception as e:
+    print(f"❌ Supabase (Licenses) Error: {e}")
+
+# 3. Supabase - Rating DB (Project B - allowed_sites)
+try:
+    # Check if keys exist in config first to avoid crash if not set
+    if hasattr(config, 'SUPABASE_RATING_URL'):
+        supabase_rating: Client = create_client(config.SUPABASE_RATING_URL, config.SUPABASE_RATING_KEY)
+        print("✅ Supabase (Ratings) Connected.")
+    else:
+        supabase_rating = None
+        print("⚠️ Supabase (Ratings) skipped: Missing config.")
+except Exception as e:
+    supabase_rating = None
+    print(f"❌ Supabase (Ratings) Error: {e}")
+
+# --- HELPER FUNCTIONS ---
+
 async def is_user_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
     try:
         admins = await context.bot.get_chat_administrators(chat_id)
@@ -55,12 +93,9 @@ async def is_user_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, u
     except Exception:
         return False
 
-# --- HELPER: Check Bot Owner ---
 def is_bot_owner(user_id):
-    # Ensure config.ADMIN_ID is treated as an integer for comparison
     return user_id == int(config.ADMIN_ID)
 
-# --- Helper: Delete Command Message ---
 async def delete_command_message(update: Update):
     """Deletes the command message sent by the user to keep chat clean (Groups Only)."""
     if update.effective_chat.type == ChatType.PRIVATE: return
@@ -70,25 +105,32 @@ async def delete_command_message(update: Update):
     except Exception:
         pass 
 
-# --- Command Handlers ---
+def generate_key():
+    """Generates a random license key: LIC-XXXXXX-XXXXXX"""
+    part1 = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    part2 = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"LIC-{part1}-{part2}"
+
+# --- START / HELP COMMANDS ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_command_message(update)
     
-    # 1. Handle Request Deep Link
-    if context.args and context.args[0].startswith("request_"):
-        try:
-            source_group_id = int(context.args[0].split('_')[1])
-            context.user_data['source_group_id'] = source_group_id
-            return await request.start_request_conversation(update, context)
-        except (ValueError, IndexError):
-            await update.message.reply_text("Invalid request link.")
-            return ConversationHandler.END
-            
-    # 2. Handle Admin Configuration Deep Link
-    if context.args and context.args[0].startswith("configure_group_"):
-        return await admin.start_proactive_configuration(update, context, group_configs_collection)
+    # Handle Deep Links
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("request_"):
+            try:
+                source_group_id = int(arg.split('_')[1])
+                context.user_data['source_group_id'] = source_group_id
+                return await request.start_request_conversation(update, context)
+            except (ValueError, IndexError):
+                await update.message.reply_text("Invalid request link.")
+                return ConversationHandler.END
+        elif arg.startswith("configure_group_"):
+            return await admin.start_proactive_configuration(update, context, group_configs_collection)
     
-    # 3. Standard Welcome Message
+    # Standard Welcome Message
     start_caption = """👋 <b>Welcome to the ABEFILM BOT OFFICIAL!</b>
 
 <b>Features available:</b>
@@ -133,7 +175,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ● <b>/theme</b> - Browse and buy themes.
     ● <b>/register &lt;KEY&gt; &lt;DOMAIN&gt;</b> - Activate license.
     ● <b>/check &lt;KEY&gt;</b> - Check license status.
-    ● <b>/removedomain &lt;KEY&gt;</b> - Reset domain.
 
     <b><u>👮‍♂️ Admin Only</u></b>
     ● <b>/broadcast</b> - Send a post to channels.
@@ -150,7 +191,8 @@ async def request_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("To make a request, please use the /request command inside a configured group.")
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ALLOW EVERYONE TO USE THIS COMMAND SO YOU CAN FIND YOUR ID
+    if not is_bot_owner(update.effective_user.id): return
+    
     message = update.effective_message
     if hasattr(message, 'forward_from_chat') and message.forward_from_chat:
         chat_id = message.forward_from_chat.id
@@ -159,6 +201,175 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         chat_id = update.effective_chat.id
         await message.reply_text(f"This chat's ID is: <code>{chat_id}</code>", parse_mode="HTML")
+
+# --- LICENSE SYSTEM HANDLERS ---
+
+async def start_gen_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Hardcoded theme list for stability/speed in menu
+    keyboard = [
+        [InlineKeyboardButton("Abeflix", callback_data="lic_theme_Abeflix")],
+        [InlineKeyboardButton("Moviebox", callback_data="lic_theme_Moviebox")],
+        [InlineKeyboardButton("IQone", callback_data="lic_theme_IQone")],
+        [InlineKeyboardButton("IQplay", callback_data="lic_theme_IQplay")],
+        [InlineKeyboardButton("Abefilm v4", callback_data="lic_theme_Abefilmv4")]
+    ]
+    await update.message.reply_text("🔑 <b>License Generator</b>\n\nSelect the Theme:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    return config.LIC_GET_THEME
+
+async def handle_theme_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['lic_theme'] = query.data.split("lic_theme_")[1]
+    
+    keyboard = [
+        [InlineKeyboardButton("Forever", callback_data="lic_dur_forever")],
+        [InlineKeyboardButton("1 Year", callback_data="lic_dur_365")],
+        [InlineKeyboardButton("1 Month", callback_data="lic_dur_30")],
+        [InlineKeyboardButton("7 Days Trial", callback_data="lic_dur_7")]
+    ]
+    await query.edit_message_text(f"Theme: <b>{context.user_data['lic_theme']}</b>\n\nSelect Duration:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    return config.LIC_GET_DURATION
+
+async def handle_duration_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    duration_code = query.data.split("lic_dur_")[1]
+    theme_name = context.user_data.get('lic_theme', 'Unknown')
+    
+    expiry_date = "2099-12-31" 
+    status_val = "forever"
+    
+    if duration_code != "forever":
+        days = int(duration_code)
+        expire_dt = datetime.datetime.now() + datetime.timedelta(days=days)
+        expiry_date = expire_dt.strftime("%Y-%m-%d")
+        status_val = "trial" if days < 30 else "active"
+
+    license_key = generate_key()
+    
+    data = {
+        "license_key": license_key,
+        "theme_name": theme_name,
+        "expiry_date": expiry_date,
+        "status": status_val
+    }
+    
+    try:
+        supabase_lic.table("licenses").insert(data).execute()
+        msg = f"✅ <b>License Created!</b>\n\n🔑 <code>{license_key}</code>\n🎨 {theme_name}\n⏳ {expiry_date}"
+        await query.edit_message_text(msg, parse_mode="HTML")
+    except Exception as e:
+        await query.edit_message_text(f"❌ Error: {e}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def register_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: await update.message.delete()
+    except: pass
+
+    args = context.args
+    if len(args) != 2:
+        await context.bot.send_message(update.effective_user.id, "⚠️ Usage: `/register <KEY> <DOMAIN>`", parse_mode="Markdown")
+        return
+
+    key = args[0].strip()
+    domain = args[1].strip().replace("https://", "").replace("http://", "").replace("/", "")
+
+    try:
+        # 1. Check License DB
+        response = supabase_lic.table("licenses").select("*").eq("license_key", key).execute()
+        if not response.data:
+            await context.bot.send_message(update.effective_user.id, "❌ License not found.")
+            return
+            
+        lic_data = response.data[0]
+
+        if lic_data.get("domain"):
+            if lic_data["domain"] == domain:
+                 await context.bot.send_message(update.effective_user.id, f"✅ Already registered to {domain}.")
+                 return
+            else:
+                 await context.bot.send_message(update.effective_user.id, f"❌ License active on: {lic_data['domain']}\nUse /removedomain first.")
+                 return
+
+        # 2. Update License DB
+        supabase_lic.table("licenses").update({"domain": domain}).eq("license_key", key).execute()
+
+        # 3. Add to Rating DB (allowed_sites)
+        if supabase_rating:
+            try:
+                check = supabase_rating.table("allowed_sites").select("*").eq("domain", domain).execute()
+                if not check.data:
+                    supabase_rating.table("allowed_sites").insert({"domain": domain}).execute()
+            except Exception as ex:
+                print(f"Rating DB Sync Error: {ex}")
+
+        await context.bot.send_message(update.effective_user.id, f"✅ <b>Success!</b>\nDomain: <code>{domain}</code> registered to <b>{lic_data['theme_name']}</b>.", parse_mode="HTML")
+        
+    except Exception as e:
+        await context.bot.send_message(update.effective_user.id, f"❌ System Error: {e}")
+
+async def remove_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: await update.message.delete()
+    except: pass
+
+    if not context.args:
+        await context.bot.send_message(update.effective_user.id, "Usage: `/removedomain <KEY>`", parse_mode="Markdown")
+        return
+        
+    key = context.args[0].strip()
+    
+    try:
+        # 1. Get Info
+        response = supabase_lic.table("licenses").select("*").eq("license_key", key).execute()
+        if not response.data:
+            await context.bot.send_message(update.effective_user.id, "❌ License not found.")
+            return
+        
+        lic_data = response.data[0]
+        domain_to_remove = lic_data.get("domain")
+
+        if not domain_to_remove:
+             await context.bot.send_message(update.effective_user.id, "ℹ️ No domain registered on this license.")
+             return
+
+        # 2. Clear License DB
+        supabase_lic.table("licenses").update({"domain": None}).eq("license_key", key).execute()
+        
+        # 3. Remove from Rating DB
+        if supabase_rating:
+            try:
+                supabase_rating.table("allowed_sites").delete().eq("domain", domain_to_remove).execute()
+            except Exception as ex:
+                print(f"Rating DB Delete Error: {ex}")
+
+        await context.bot.send_message(update.effective_user.id, f"✅ Domain <code>{domain_to_remove}</code> removed.", parse_mode="HTML")
+        
+    except Exception as e:
+         await context.bot.send_message(update.effective_user.id, f"Error: {e}")
+
+async def check_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: await update.message.delete()
+    except: pass
+
+    if not context.args:
+        await context.bot.send_message(update.effective_user.id, "Usage: `/check <KEY>`", parse_mode="Markdown")
+        return
+        
+    key = context.args[0].strip()
+    try:
+        response = supabase_lic.table("licenses").select("*").eq("license_key", key).execute()
+        if not response.data:
+            await context.bot.send_message(update.effective_user.id, "❌ Not found.")
+            return
+        d = response.data[0]
+        msg = f"🔍 <b>Details</b>\nTheme: {d['theme_name']}\nDomain: {d['domain'] or 'None'}\nExpires: {d['expiry_date']}"
+        await context.bot.send_message(update.effective_user.id, msg, parse_mode="HTML")
+    except Exception as e:
+        await context.bot.send_message(update.effective_user.id, f"Error: {e}")
+
 
 # --- GROUP MANAGEMENT ---
 async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,24 +659,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # --- ADMIN WRAPPERS ---
 async def add_theme_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_command_message(update)
-    if not is_bot_owner(update.effective_user.id):
-        await update.message.reply_text(NOT_ADMIN_MESSAGE)
-        return ConversationHandler.END
+    if not is_bot_owner(update.effective_user.id): return
     return await themes.add_theme_start(update, context)
 
 async def del_theme_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_command_message(update)
-    if not is_bot_owner(update.effective_user.id):
-        await update.message.reply_text(NOT_ADMIN_MESSAGE)
-        return ConversationHandler.END
+    if not is_bot_owner(update.effective_user.id): return
     return await themes.delete_theme_start(update, context)
 
 async def gen_license_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_command_message(update)
-    if not is_bot_owner(update.effective_user.id):
-        await update.message.reply_text(NOT_ADMIN_MESSAGE)
-        return ConversationHandler.END
-    return await licenses.start_gen_license(update, context)
+    if not is_bot_owner(update.effective_user.id): return
+    return await start_gen_license(update, context)
 
 def main():
     persistence = PicklePersistence(filepath="bot_persistence")
@@ -594,10 +799,10 @@ def main():
             CommandHandler("createlicense", gen_license_wrapper)
         ],
         states={
-            config.LIC_GET_THEME: [CallbackQueryHandler(licenses.handle_theme_selection, pattern=r"^lic_theme_")],
-            config.LIC_GET_DURATION: [CallbackQueryHandler(licenses.handle_duration_selection, pattern=r"^lic_dur_")]
+            config.LIC_GET_THEME: [CallbackQueryHandler(handle_theme_selection, pattern=r"^lic_theme_")],
+            config.LIC_GET_DURATION: [CallbackQueryHandler(handle_duration_selection, pattern=r"^lic_dur_")]
         },
-        fallbacks=[CommandHandler("cancel", licenses.cancel)],
+        fallbacks=[CommandHandler("cancel", cancel)],
         name="lic_gen"
     ))
 
@@ -606,10 +811,10 @@ def main():
     app.add_handler(CallbackQueryHandler(themes.handle_theme_callback, pattern=r"^theme_"))
 
     # License User Commands
-    app.add_handler(CommandHandler("register", licenses.register_license))
-    app.add_handler(CommandHandler("check", licenses.check_license))
-    app.add_handler(CommandHandler("removedomain", licenses.remove_domain))
-    app.add_handler(CommandHandler("resetlicense", licenses.remove_domain))
+    app.add_handler(CommandHandler("register", register_license))
+    app.add_handler(CommandHandler("check", check_license))
+    app.add_handler(CommandHandler("removedomain", remove_domain))
+    app.add_handler(CommandHandler("resetlicense", remove_domain))
 
     app.add_handler(CallbackQueryHandler(request.handle_request_tracking, pattern=r"^req_track\|"))
     app.add_handler(CallbackQueryHandler(handle_reaction, pattern=r"^react_"))
