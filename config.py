@@ -2,27 +2,25 @@
 
 # --- Telegram Bot Configuration ---
 BOT_TOKEN = '8068977426:AAHc9P8o_dd99l2e798D4XDpNsN1KeaDxo8'
-
-# --- OWNER_GROUP ---
-OWNER_GROUP = '-1001817573310'
-
-# --- TMDB API Configuration ---
-TMDB_API_KEY = '8b23434c25286f8846655c6c6bfc7bf2'
+ADMIN_ID = 1945159045
 
 # --- Bot Settings ---
-DEFAULT_THUMBNAIL = "https://i.imgur.com/q8veKmY.png"
+DEFAULT_THUMBNAIL = "https://i.postimg.cc/zDKwbb3g/image.png"
 
-# --- Default Thumbnails for Request System ---
 DEFAULT_MOVIE_THUMBNAILS = [
-    "https://i.imgur.com/dX4FpNj.jpeg",
-    "https://i.imgur.com/GpGcQqU.jpeg",
-    "https://i.imgur.com/GkE4Ap6.jpeg"
+    "https://i.postimg.cc/tCGCPFz0/image.png",
+    "https://i.postimg.cc/y89dtvYz/Gk-E4Ap6.jpg",
+    "https://i.postimg.cc/K8XcPBrG/image.png"
 ]
 DEFAULT_CONCERN_THUMBNAILS = [
-    "https://i.imgur.com/FgryI9n.jpeg",
-    "https://i.imgur.com/c6lLmB5.jpeg",
-    "https://i.imgur.com/9ocFVJS.jpeg"
+    "https://i.postimg.cc/d0fJ0C1t/image.png",
+    "https://i.postimg.cc/DycFXHZJ/image.png",
+    "https://i.postimg.cc/XqbSZk6c/image.png"
 ]
+
+# --- Supabase Configuration ---
+SUPABASE_URL = "https://pvefdmvjveyoeltewmli.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB2ZWZkbXZqdmV5b2VsdGV3bWxpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTg0NDE0OCwiZXhwIjoyMDcxNDIwMTQ4fQ.gDSaX4MqeaH4_DYxPA-9pHCCPOdqX6grpY9qkE1LPhw" # Not the ANON key
 
 # --- MongoDB Configuration ---
 MONGO_URI = "mongodb+srv://abefilm:makeitreal1@abefilmtmdb.azh1fvb.mongodb.net/?retryWrites=true&w=majority&appName=ABEFILMTMDB"
@@ -32,7 +30,10 @@ BROADCASTS_COLLECTION_NAME = "broadcasts"
 SETTINGS_COLLECTION_NAME = "settings"
 GROUP_CONFIGS_COLLECTION_NAME = "group_configs"
 
+
+
 # --- Conversation Handler States ---
+
 # Broadcasting
 (
     GET_THUMBNAIL, GET_TITLE, GET_DESCRIPTION,
@@ -43,37 +44,39 @@ GROUP_CONFIGS_COLLECTION_NAME = "group_configs"
 (
     GET_SOURCE_NAME, GET_MOVIE_URL, GET_TV_URL
 ) = range(6, 9)
-DELETING_SOURCE = 9
-TOGGLE_SOURCE = 10
 
-# --- Request Workflow States (CORRECTED SECTION) ---
+# Request Workflow
 (
-    REQ_CHOOSE_TYPE,
-    # Movie/TV Flow
-    REQ_GET_POSTER,
-    REQ_GET_TITLE,
-    REQ_GET_MEDIA_TYPE,
-    REQ_GET_YEAR,
-    REQ_GET_COUNTRY,
-    REQ_GET_NOTE,
-    # Concern Flow (Renamed and reordered for logical flow)
     REQ_GET_CONCERN_SUBJECT,
-    REQ_GET_CONCERN_IMAGE,      # <-- RENAMED from _SCREENSHOT and MOVED
+    REQ_GET_CONCERN_IMAGE,
     REQ_GET_CONCERN_DETAIL,
-    # Admin Flow
     AWAITING_REMARK
-) = range(11, 22)
+) = range(10, 14)
 
-# UNIFIED /addgroup States
+# Group Management
 (
-    CHOOSE_GROUP_TYPE,
-    ADD_BROADCAST_GROUP_ID,
-    AWAITING_SOURCE_GROUP_FORWARD,
-    AWAITING_DEST_GROUP_FORWARD
-) = range(22, 26)
+    CHOOSE_GROUP_TYPE, ADD_BROADCAST_GROUP_ID,
+    AWAITING_SOURCE_GROUP_FORWARD, AWAITING_DEST_GROUP_FORWARD
+) = range(14, 18)
 
-# States for /deletegroup
-DELETING_GROUP = 26
+# Other Admin Actions
+DELETING_GROUP = 18
+AWAITING_DEST_GROUP_FOR_CONFIG = 19
+AWAITING_DEST_TOPIC_ID = 20
 
-# NEW: Simplified state for Generate Post Code (only for TV shows)
-AWAITING_SEASON_CHOICE = 27
+# Theme Management
+(
+    THEME_GET_NAME,
+    THEME_GET_IMAGE,
+    THEME_GET_DESC,
+    THEME_GET_DEMO,
+    THEME_GET_DOCS,
+    THEME_GET_BUY
+) = range(21, 27)
+
+THEME_DELETE_CHOICE = 27
+
+# License Management
+(
+    LIC_GET_THEME, LIC_GET_DURATION
+) = range(28, 30)
