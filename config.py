@@ -7,20 +7,14 @@ ADMIN_ID = 1945159045
 # --- Bot Settings ---
 DEFAULT_THUMBNAIL = "https://i.postimg.cc/zDKwbb3g/image.png"
 
-DEFAULT_MOVIE_THUMBNAILS = [
-    "https://i.postimg.cc/tCGCPFz0/image.png",
-    "https://i.postimg.cc/y89dtvYz/Gk-E4Ap6.jpg",
-    "https://i.postimg.cc/K8XcPBrG/image.png"
-]
+# Default Thumbnails for Request System
 DEFAULT_CONCERN_THUMBNAILS = [
     "https://i.postimg.cc/d0fJ0C1t/image.png",
     "https://i.postimg.cc/DycFXHZJ/image.png",
     "https://i.postimg.cc/XqbSZk6c/image.png"
 ]
-
-# --- Supabase Configuration ---
-SUPABASE_URL = "https://pvefdmvjveyoeltewmli.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB2ZWZkbXZqdmV5b2VsdGV3bWxpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTg0NDE0OCwiZXhwIjoyMDcxNDIwMTQ4fQ.gDSaX4MqeaH4_DYxPA-9pHCCPOdqX6grpY9qkE1LPhw" # Not the ANON key
+# Kept for compatibility if request.py still references it, though unused for movies now
+DEFAULT_MOVIE_THUMBNAILS = DEFAULT_CONCERN_THUMBNAILS 
 
 # --- MongoDB Configuration ---
 MONGO_URI = "mongodb+srv://abefilm:makeitreal1@abefilmtmdb.azh1fvb.mongodb.net/?retryWrites=true&w=majority&appName=ABEFILMTMDB"
@@ -30,7 +24,13 @@ BROADCASTS_COLLECTION_NAME = "broadcasts"
 SETTINGS_COLLECTION_NAME = "settings"
 GROUP_CONFIGS_COLLECTION_NAME = "group_configs"
 
+# --- SUPABASE PROJECT 1 (License System) ---
+SUPABASE_URL = "https://pvefdmvjveyoeltewmli.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB2ZWZkbXZqdmV5b2VsdGV3bWxpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTg0NDE0OCwiZXhwIjoyMDcxNDIwMTQ4fQ.gDSaX4MqeaH4_DYxPA-9pHCCPOdqX6grpY9qkE1LPhw"
 
+# --- SUPABASE PROJECT 2 (Rating System / allowed_sites) ---
+SUPABASE_RATING_URL = "https://agfwyfwsnqnklgcgemnw.supabase.co"
+SUPABASE_RATING_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnZnd5ZndzbnFua2xnY2dlbW53Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NzIxNDcxNCwiZXhwIjoyMDcyNzkwNzE0fQ.m6cE-ZulAaf8hRMchOQLkNDNSGcr1DMMcEGBP0OObOU"
 
 # --- Conversation Handler States ---
 
@@ -39,11 +39,6 @@ GROUP_CONFIGS_COLLECTION_NAME = "group_configs"
     GET_THUMBNAIL, GET_TITLE, GET_DESCRIPTION,
     GET_BUTTONS, GET_REACTIONS, CHOOSE_TARGET
 ) = range(6)
-
-# Source Management
-(
-    GET_SOURCE_NAME, GET_MOVIE_URL, GET_TV_URL
-) = range(6, 9)
 
 # Request Workflow
 (
