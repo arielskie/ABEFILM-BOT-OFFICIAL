@@ -1,18 +1,8 @@
 import pymongo
-import io
 import logging
-import json
-from bson.objectid import ObjectId
-from datetime import datetime
 from functools import partial
-import re
-import traceback
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from bson.objectid import ObjectId
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -21,16 +11,17 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ConversationHandler,
-    InlineQueryHandler,
     PicklePersistence,
 )
 from telegram.error import BadRequest
 from telegram.constants import ChatType
 
 import config
-import search
 import request
 import broadcast
+import admin
+import themes
+import licenses
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -41,9 +32,7 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 PRIVATE_CHAT_ONLY_MESSAGE = "This command can only be used in a private chat with me."
-# States for the new unified server conversation
-VIEWING_SERVERS, DELETING_SERVER_CHOICE = range(100, 102)
-
+NOT_ADMIN_MESSAGE = "⛔ You are not authorized to use this command."
 
 # --- MongoDB Client Initialization ---
 try:
@@ -58,50 +47,34 @@ except Exception as e:
     print(f"❌ FATAL: Could not connect to MongoDB: {e}")
     exit()
 
-### --- FIXED: The URL for Vidlink.pro movie was incorrect. --- ###
-DEFAULT_SOURCES = [
-    {"name": "Vidsrc.to", "movie_url": "https://vidsrc.to/embed/movie/{tmdb_id}", "tv_url": "https://vidsrc.to/embed/tv/{tmdb_id}/{season}/{episode}"},
-    {"name": "Vidsrc.co", "movie_url": "https://player.vidsrc.co/embed/movie/{tmdb_id}", "tv_url": "https://player.vidsrc.co/embed/tv/{tmdb_id}/{season}/{episode}"},
-    {"name": "Vidsrc.vip", "movie_url": "https://vidsrc.vip/embed/movie/{tmdb_id}", "tv_url": "https://vidsrc.vip/embed/tv/{tmdb_id}/{season}/{episode}"},
-    {"name": "Vidlink.pro", "movie_url": "https://vidlink.pro/embed/movie/{tmdb_id}", "tv_url": "https://vidlink.pro/tv/{tmdb_id}/{season}/{episode}"},
-    {"name": "Autoembed.pro", "movie_url": "https://autoembed.pro/embed/movie/{tmdb_id}", "tv_url": "https://autoembed.pro/embed/tv/{tmdb_id}/{season}/{episode}"},
-    {"name": "Vidapi.xyz", "movie_url": "https://vidapi.xyz/embed/movie/{tmdb_id}", "tv_url": "https://vidapi.xyz/embed/tv/{tmdb_id}&s={season}&e={episode}"},
-    {"name": "Vidpop.xyz", "movie_url": "https://www.vidpop.xyz/embed/?id={tmdb_id}", "tv_url": "https://www.vidpop.xyz/embed/?id={tmdb_id}&season={season}&episode={episode}"}
-]
-
 # --- HELPER: Checks if a user is an admin in a chat ---
 async def is_user_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
     try:
         admins = await context.bot.get_chat_administrators(chat_id)
         return user_id in [admin.user.id for admin in admins]
-    except Exception as e:
-        print(f"Error checking admin status: {e}")
+    except Exception:
         return False
 
-# --- HELPER: Checks if a user is in the owner's group ---
-try:
-    OWNER_GROUP_INT_ID = int(config.OWNER_GROUP)
-except (ValueError, TypeError):
-    logger.error("OWNER_GROUP ID in config is not a valid integer. Search restriction will not work.")
-    OWNER_GROUP_INT_ID = None
+# --- HELPER: Check Bot Owner ---
+def is_bot_owner(user_id):
+    # Ensure config.ADMIN_ID is treated as an integer for comparison
+    return user_id == int(config.ADMIN_ID)
 
-async def is_member_of_owner_group(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not OWNER_GROUP_INT_ID:
-        return False # Fail safely if ID is not configured correctly
+# --- Helper: Delete Command Message ---
+async def delete_command_message(update: Update):
+    """Deletes the command message sent by the user to keep chat clean (Groups Only)."""
+    if update.effective_chat.type == ChatType.PRIVATE: return
     try:
-        member = await context.bot.get_chat_member(chat_id=OWNER_GROUP_INT_ID, user_id=user_id)
-        return member.status in ['creator', 'administrator', 'member', 'restricted']
-    except BadRequest as e:
-        if "user not found" in str(e).lower():
-            return False
-        logger.warning(f"Could not check membership for user {user_id} in group {OWNER_GROUP_INT_ID}: {e}")
-        return False # Assume not a member if there's an error
-    except Exception as e:
-        logger.error(f"Unexpected error checking membership for user {user_id}: {e}")
-        return False
+        if update.message:
+            await update.message.delete()
+    except Exception:
+        pass 
 
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
+    
+    # 1. Handle Request Deep Link
     if context.args and context.args[0].startswith("request_"):
         try:
             source_group_id = int(context.args[0].split('_')[1])
@@ -110,111 +83,94 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (ValueError, IndexError):
             await update.message.reply_text("Invalid request link.")
             return ConversationHandler.END
+            
+    # 2. Handle Admin Configuration Deep Link
+    if context.args and context.args[0].startswith("configure_group_"):
+        return await admin.start_proactive_configuration(update, context, group_configs_collection)
     
+    # 3. Standard Welcome Message
     start_caption = """👋 <b>Welcome to the ABEFILM BOT OFFICIAL!</b>
 
-1️⃣ <b>Group Features</b>
-● /search &lt;title&gt;: Find movie/TV info.
-● /request: Start a movie request (in configured groups).
-● Or use inline: @abefilmofficialbot &lt;title&gt;
+<b>Features available:</b>
+● <b>/request</b>: Request content (in groups).
+● <b>/theme</b>: Browse & Buy Premium Themes.
+● <b>/register</b>: Activate your Theme License.
+● <b>/check</b>: Check License Status.
+● <b>/removedomain</b>: Remove/Reset License Domain.
 
-2️⃣ <b>Broadcast Features (Private)</b>
-● /broadcast: Create and send a post to a channel.
-● /addgroup: Register a group for broadcasting or requests.
-● /mygroups: View your registered groups.
-● /deletegroup: Delete a registered group or configuration.
-
-3️⃣ <b>Post Code Generator (Private)</b>
-● /myserver: Manage your video sources (servers) in an interactive menu.
-
-4️⃣ <b>Other Commands</b>
-● /start: Shows this message.
-● /cancel: Cancels the current operation.
-● /help: Shows the detailed command guide.
-● /getid: Get the current chat's ID, or the ID from a forwarded message.
+<b>Admin Tools:</b>
+● /broadcast, /addgroup, /mygroups
+● /createlicense, /addtheme, /deletetheme
 """
     keyboard = [[InlineKeyboardButton("🚀 Telegram Group", url="https://t.me/abeflixgroupchat")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_photo(photo=config.DEFAULT_THUMBNAIL, caption=start_caption, parse_mode="HTML", reply_markup=reply_markup)
+    
+    try:
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=config.DEFAULT_THUMBNAIL, 
+            caption=start_caption, 
+            parse_mode="HTML", 
+            reply_markup=reply_markup
+        )
+    except Exception:
+        await update.message.reply_text(start_caption, parse_mode="HTML", reply_markup=reply_markup)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
     if update.message.chat.type != 'private':
-        await update.message.reply_text("Please use the /help command in a private chat with me for a full guide.")
+        try:
+            await context.bot.send_message(update.effective_user.id, "Please use /help in a private chat.")
+        except:
+            pass
         return
 
     user_guide = """
     👋 <b>Bot Command Guide</b>
-
-    Here is a detailed guide on how to use my features. Commands marked with (Admin) require you to be an admin in the relevant group.
-
-    <b><u>🔎 General Commands</u></b>
-    ● /search <code>&lt;title&gt;</code>
-      - Finds movies or TV shows.
-      - <i>Example:</i> <code>/search The Matrix</code>
-
-    ● /request
-      - Starts a request for a movie or TV show. Must be used inside a configured group, which will then send you a private message to continue.
-
-    <b><u>📢 Broadcasting Features (Private)</u></b>
-    ● /broadcast
-      - Starts a step-by-step process to create and send a formatted post to a channel.
-      - <i>Flow: Thumbnail → Title → Description → Buttons → Reactions.</i>
     
-    ● /addgroup
-      - (Admin) Links groups/channels to the bot for broadcasting or user requests.
-      - You will be asked if it's for broadcasting or for requests.
+    <b><u>👤 User Commands</u></b>
+    ● <b>/request</b> - Start a request (inside groups).
+    ● <b>/theme</b> - Browse and buy themes.
+    ● <b>/register &lt;KEY&gt; &lt;DOMAIN&gt;</b> - Activate license.
+    ● <b>/check &lt;KEY&gt;</b> - Check license status.
+    ● <b>/removedomain &lt;KEY&gt;</b> - Reset domain.
 
-    ● /mygroups
-      - (Admin) Lists all the groups and request configurations you have set up.
-
-    ● /deletegroup
-      - (Admin) Removes a group or a request configuration you previously set up.
-
-    <b><u>⚙️ Post Code & Server Management (Private)</u></b>
-    ● /myserver
-      - Manage your custom video sources (servers) used for the 'Generate Post Code' feature. You can add, delete, and toggle sources.
-    
-    <b><u>🛠️ Utility Commands</u></b>
-    ● /start
-      - Shows the main welcome message.
-
-    ● /getid
-      - Replies with the current chat's ID. If you reply to a forwarded message, it gives the ID of the original channel/group.
-
-    ● /cancel
-      - Stops any active multi-step command you are in (like /addgroup or /broadcast).
+    <b><u>👮‍♂️ Admin Only</u></b>
+    ● <b>/broadcast</b> - Send a post to channels.
+    ● <b>/addgroup</b> - Register groups.
+    ● <b>/mygroups</b> - List groups.
+    ● <b>/addtheme</b> - Add new theme.
+    ● <b>/deletetheme</b> - Remove theme.
+    ● <b>/createlicense</b> - Generate key.
     """
     await update.message.reply_text(user_guide, parse_mode="HTML", disable_web_page_preview=True)
 
-
 async def request_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
     await update.message.reply_text("To make a request, please use the /request command inside a configured group.")
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ALLOW EVERYONE TO USE THIS COMMAND SO YOU CAN FIND YOUR ID
     message = update.effective_message
-    
-    forward_chat = None
     if hasattr(message, 'forward_from_chat') and message.forward_from_chat:
-        forward_chat = message.forward_from_chat
-    elif message.forward_origin and hasattr(message.forward_origin, 'chat') and message.forward_origin.chat:
-         forward_chat = message.forward_origin.chat
-
-    if forward_chat:
-        chat_id = forward_chat.id
-        chat_title = forward_chat.title
-        await message.reply_text(
-            f"The forwarded message is from:\n"
-            f"<b>{chat_title}</b>\n"
-            f"ID: <code>{chat_id}</code>",
-            parse_mode="HTML"
-        )
+        chat_id = message.forward_from_chat.id
+        title = message.forward_from_chat.title
+        await message.reply_text(f"Forward from: <b>{title}</b>\nID: <code>{chat_id}</code>", parse_mode="HTML")
     else:
         chat_id = update.effective_chat.id
         await message.reply_text(f"This chat's ID is: <code>{chat_id}</code>", parse_mode="HTML")
 
 # --- GROUP MANAGEMENT ---
 async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != 'private': await update.message.reply_text(PRIVATE_CHAT_ONLY_MESSAGE); return ConversationHandler.END
+    await delete_command_message(update)
+    if not is_bot_owner(update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN_MESSAGE)
+        return ConversationHandler.END
+        
+    if update.message.chat.type != 'private': 
+        await update.message.reply_text(PRIVATE_CHAT_ONLY_MESSAGE)
+        return ConversationHandler.END
+        
     keyboard = [[InlineKeyboardButton("📢 For My Broadcasts", callback_data="add_broadcast")], [InlineKeyboardButton("📝 For User Requests", callback_data="add_request")]]
     await update.message.reply_text("What is the purpose of the group you want to add?", reply_markup=InlineKeyboardMarkup(keyboard))
     return config.CHOOSE_GROUP_TYPE
@@ -243,25 +199,42 @@ async def get_chat_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> t
         chat_id = forward_chat.id
         chat_title = forward_chat.title
     elif message.text:
+        text_input = message.text.strip()
+        if "_" in text_input:
+            try: chat_id = int(text_input.split("_")[0]) 
+            except ValueError: await message.reply_text("Invalid ID format."); return None, None
+        else:
+            try: chat_id = int(text_input)
+            except (ValueError, BadRequest): await message.reply_text("That is not a valid numeric ID."); return None, None
+        
         try:
-            chat_id = int(message.text.strip())
             chat = await context.bot.get_chat(chat_id)
             chat_title = chat.title
-        except (ValueError, BadRequest):
-            await message.reply_text("That is not a valid numeric ID or I can't access it.")
-            return None, None
-        except Exception as e:
-            await message.reply_text(f"Could not get info for that ID. Error: {e}")
+        except Exception:
+            await message.reply_text(f"Could not access chat {chat_id}. Make sure I am an Admin there first!")
             return None, None
             
     return chat_id, chat_title
 
-
 async def save_broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, chat_title = await get_chat_info(update, context)
     if not chat_id: return config.ADD_BROADCAST_GROUP_ID
-    user_collection.update_one({"user_id": update.effective_user.id}, {"$addToSet": {"broadcast_groups": {"id": str(chat_id), "title": chat_title}}}, upsert=True)
-    await update.message.reply_text(f"✅ Success! You can now broadcast to **{chat_title}**.", parse_mode="HTML")
+    
+    thread_id = None
+    if update.message.text and "_" in update.message.text:
+        try:
+            parts = update.message.text.strip().split("_")
+            if len(parts) == 2 and parts[1].isdigit():
+                thread_id = int(parts[1])
+        except Exception:
+            pass
+
+    group_data = {"id": str(chat_id), "title": chat_title, "thread_id": thread_id}
+    user_collection.update_one({"user_id": update.effective_user.id}, {"$pull": {"broadcast_groups": {"id": str(chat_id), "thread_id": thread_id}}})
+    user_collection.update_one({"user_id": update.effective_user.id}, {"$addToSet": {"broadcast_groups": group_data}}, upsert=True)
+    
+    topic_msg = f" (Topic: {thread_id})" if thread_id else ""
+    await update.message.reply_text(f"✅ Success! You can now broadcast to **{chat_title}**{topic_msg}.", parse_mode="HTML")
     return ConversationHandler.END
 
 async def handle_source_group_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -274,18 +247,85 @@ async def handle_source_group_forward(update: Update, context: ContextTypes.DEFA
     return config.AWAITING_DEST_GROUP_FORWARD
 
 async def handle_dest_group_and_save_config(update: Update, context: ContextTypes.DEFAULT_TYPE, group_configs_collection):
-    source_group_id = context.user_data.get('source_group_id_to_set'); source_group_title = context.user_data.get('source_group_title_to_set')
-    if not source_group_id: await update.message.reply_text("Error. Please start over."); return ConversationHandler.END
+    source_group_id = context.user_data.get('source_group_id_to_set')
+    source_group_title = context.user_data.get('source_group_title_to_set')
+    
+    if not source_group_id: 
+        await update.message.reply_text("Error. Please start over.")
+        return ConversationHandler.END
+        
     dest_chat_id, dest_chat_title = await get_chat_info(update, context)
     if not dest_chat_id: return config.AWAITING_DEST_GROUP_FORWARD
-    group_configs_collection.update_one({"_id": source_group_id}, {"$set": {"request_group_id": dest_chat_id, "request_group_title": dest_chat_title, "admin_id": update.effective_user.id}}, upsert=True)
-    await update.message.reply_text(f"✅ **Success!** Requests from **{source_group_title}** will now be sent to **{dest_chat_title}**.", parse_mode="HTML")
-    context.user_data.clear(); return ConversationHandler.END
+
+    try:
+        full_chat = await context.bot.get_chat(dest_chat_id)
+        if full_chat.is_forum:
+            context.user_data['dest_group_id_pending'] = dest_chat_id
+            context.user_data['dest_group_title_pending'] = dest_chat_title
+            await update.message.reply_text(
+                f"⚠️ **Topic Detected in {dest_chat_title}**\n\n"
+                "Please send me the **Topic ID** (Thread ID) where requests should be sent.\n"
+                "• Send <code>4493</code> for your Request Sub-topic.\n"
+                "• Send <code>0</code> for General.",
+                parse_mode="HTML"
+            )
+            return config.AWAITING_DEST_TOPIC_ID
+    except Exception as e:
+        logger.error(f"Forum check error: {e}")
+
+    group_configs_collection.update_one(
+        {"_id": source_group_id}, 
+        {"$set": {"request_group_id": dest_chat_id, "request_group_title": dest_chat_title, "request_thread_id": None, "admin_id": update.effective_user.id}}, 
+        upsert=True
+    )
+    await update.message.reply_text(f"✅ **Success!** Requests from **{source_group_title}** will go to **{dest_chat_title}**.", parse_mode="HTML")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def handle_dest_topic_selection_manual(update: Update, context: ContextTypes.DEFAULT_TYPE, group_configs_collection):
+    topic_input = update.message.text.strip()
+    source_group_id = context.user_data.get('source_group_id_to_set')
+    source_group_title = context.user_data.get('source_group_title_to_set')
+    dest_chat_id = context.user_data.get('dest_group_id_pending')
+    dest_chat_title = context.user_data.get('dest_group_title_pending')
+
+    if not topic_input.isdigit():
+        await update.message.reply_text("Please send a numeric Topic ID (e.g., 4493).")
+        return config.AWAITING_DEST_TOPIC_ID
+        
+    thread_id = int(topic_input)
+    if thread_id == 0: thread_id = None
+
+    group_configs_collection.update_one(
+        {"_id": source_group_id}, 
+        {"$set": {"request_group_id": dest_chat_id, "request_group_title": dest_chat_title, "request_thread_id": thread_id, "admin_id": update.effective_user.id}}, 
+        upsert=True
+    )
+    
+    topic_label = f" (Topic: {thread_id})" if thread_id else " (General)"
+    await update.message.reply_text(f"✅ **Success!** Requests from **{source_group_title}** will go to **{dest_chat_title}**{topic_label}.", parse_mode="HTML")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 async def my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
+    if not is_bot_owner(update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN_MESSAGE)
+        return
+
     user_id = update.effective_user.id; message_parts = []
-    user_data = user_collection.find_one({"user_id": user_id}); broadcast_groups = user_data.get("broadcast_groups", []) if user_data else []
-    if broadcast_groups: message_parts.append("<b>📢 Your Personal Broadcast Groups:</b>"); [message_parts.append(f"- {g['title']} (ID: <code>{g['id']}</code>)") for g in broadcast_groups]
+    user_data = user_collection.find_one({"user_id": user_id})
+    broadcast_groups = user_data.get("broadcast_groups", []) if user_data else []
+    
+    if broadcast_groups: 
+        message_parts.append("<b>📢 Your Personal Broadcast Groups:</b>")
+        for g in broadcast_groups:
+            title = g['title']
+            g_id = g['id']
+            if g.get('thread_id'):
+                title += f" [Topic: {g['thread_id']}]"
+            message_parts.append(f"- {title} (ID: <code>{g_id}</code>)")
+
     request_configs = group_configs_collection.find({"admin_id": user_id}); request_group_list = list(request_configs)
     if request_group_list:
         if message_parts: message_parts.append("")
@@ -295,11 +335,18 @@ async def my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: source_chat = await context.bot.get_chat(config_doc['_id']); source_title = source_chat.title
             except Exception: pass
             dest_title = config_doc.get('request_group_title', 'Unknown')
-            message_parts.append(f"• In <b>{source_title}</b> → requests go to <b>{dest_title}</b>")
+            thread_id = config_doc.get('request_thread_id')
+            topic_str = f" (Topic: {thread_id})" if thread_id else ""
+            message_parts.append(f"• In <b>{source_title}</b> → requests go to <b>{dest_title}</b>{topic_str}")
     if not message_parts: await update.message.reply_text("You have not registered any groups.")
     else: await update.message.reply_text("\n".join(message_parts), parse_mode="HTML")
 
 async def delete_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
+    if not is_bot_owner(update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN_MESSAGE)
+        return ConversationHandler.END
+
     if update.message.chat.type != 'private': await update.message.reply_text(PRIVATE_CHAT_ONLY_MESSAGE); return ConversationHandler.END
     user_id = update.effective_user.id; buttons = []
     user_data = user_collection.find_one({"user_id": user_id}); broadcast_groups = user_data.get("broadcast_groups", []) if user_data else []
@@ -327,318 +374,30 @@ async def handle_delete_group_selection(update: Update, context: ContextTypes.DE
     else: await query.edit_message_text("An unknown error occurred.")
     return ConversationHandler.END
 
-# --- SOURCE MANAGEMENT ---
-async def _get_server_management_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    user_doc = user_collection.find_one({"user_id": user_id})
-    custom_sources = user_doc.get("sources", []) if user_doc else []
-    disabled_sources = user_doc.get("disabled_sources", []) if user_doc else []
-    all_sources = DEFAULT_SOURCES + custom_sources
-    
-    keyboard = []
-    row = []
-    for source in all_sources:
-        name = source['name']
-        status_icon = "❌" if name in disabled_sources else "✅"
-        button = InlineKeyboardButton(f"{status_icon} {name}", callback_data=f"server_toggle_{name}")
-        row.append(button)
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-        
-    keyboard.append([
-        InlineKeyboardButton("➕ Add", callback_data="server_add"),
-        InlineKeyboardButton("➖ Delete", callback_data="server_delete"),
-        InlineKeyboardButton("🔄 Reset", callback_data="server_reset")
-    ])
-    keyboard.append([InlineKeyboardButton("Done", callback_data="server_done")])
-    
-    return InlineKeyboardMarkup(keyboard)
-
-async def my_server_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.chat.type != 'private':
-        await update.message.reply_text(PRIVATE_CHAT_ONLY_MESSAGE)
+# --- BROADCAST WRAPPER (RESTRICTION) ---
+async def start_broadcast_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
+    if not is_bot_owner(update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN_MESSAGE)
         return ConversationHandler.END
-        
-    user_id = update.effective_user.id
-    keyboard = await _get_server_management_keyboard(user_id)
-    await update.message.reply_text(
-        "⚙️ **Server Management**\n\n"
-        "Click on a server to toggle it (✅ Enabled / ❌ Disabled).\n"
-        "Use the buttons below to manage your custom servers.",
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-    return VIEWING_SERVERS
+    return await broadcast.start_broadcast(update, context)
 
-async def my_server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    
-    action = query.data.split('_', 1)[1]
-
-    if query.data.startswith("server_toggle_"):
-        source_name = action.split('_', 1)[1]
-        user_doc = user_collection.find_one({"user_id": user_id})
-        disabled_sources = user_doc.get("disabled_sources", []) if user_doc else []
-        
-        if source_name in disabled_sources:
-            user_collection.update_one({"user_id": user_id}, {"$pull": {"disabled_sources": source_name}})
-        else:
-            user_collection.update_one({"user_id": user_id}, {"$addToSet": {"disabled_sources": source_name}}, upsert=True)
-            
-        keyboard = await _get_server_management_keyboard(user_id)
-        await query.edit_message_reply_markup(reply_markup=keyboard)
-        return VIEWING_SERVERS
-
-    if action == "add":
-        await query.edit_message_text("Enter the name for the new source (e.g., 'MyServer').")
-        return config.GET_SOURCE_NAME
-        
-    elif action == "delete":
-        user_doc = user_collection.find_one({"user_id": user_id})
-        custom_sources = user_doc.get("sources", []) if user_doc else []
-        if not custom_sources:
-            await query.answer("You have no custom sources to delete.", show_alert=True)
-            return VIEWING_SERVERS
-        
-        buttons = [[InlineKeyboardButton(f"❌ {source['name']}", callback_data=f"delsrc_{source['name']}")] for source in custom_sources]
-        buttons.append([InlineKeyboardButton("« Back", callback_data="server_back")])
-        await query.edit_message_text("Select a custom source to delete:", reply_markup=InlineKeyboardMarkup(buttons))
-        return DELETING_SERVER_CHOICE
-
-    elif action == "reset":
-        user_collection.update_one({"user_id": user_id}, {"$set": {"sources": [], "disabled_sources": []}}, upsert=True)
-        keyboard = await _get_server_management_keyboard(user_id)
-        await query.edit_message_text(
-            "✅ All custom sources removed and defaults re-enabled.\n\n"
-            "⚙️ **Server Management**",
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-        return VIEWING_SERVERS
-        
-    elif action == "done":
-        await query.edit_message_text("✅ Your server settings have been saved.")
-        return ConversationHandler.END
-
-    return VIEWING_SERVERS
-
-async def my_server_delete_source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "server_back":
-        keyboard = await _get_server_management_keyboard(query.from_user.id)
-        await query.edit_message_text(
-            "⚙️ **Server Management**",
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-        return VIEWING_SERVERS
-    
-    source_name = query.data.split("_", 1)[1]
-    user_collection.update_one(
-        {"user_id": query.from_user.id},
-        {"$pull": {"sources": {"name": source_name}}}
-    )
-    
-    await query.answer(f"✅ Source '{source_name}' deleted.", show_alert=True)
-    
-    keyboard = await _get_server_management_keyboard(query.from_user.id)
-    await query.edit_message_text(
-        "⚙️ **Server Management**",
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-    return VIEWING_SERVERS
-
-async def my_server_get_source_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['new_source_name'] = update.message.text.strip()
-    await update.message.reply_text("Great. Now, enter the URL for MOVIES.\nUse `{tmdb_id}` as a placeholder for the TMDB ID.")
-    return config.GET_MOVIE_URL
-
-async def my_server_get_movie_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['new_movie_url'] = update.message.text.strip()
-    await update.message.reply_text("Finally, enter the URL for TV SHOWS.\nUse `{tmdb_id}`, `{season}`, and `{episode}` as placeholders.")
-    return config.GET_TV_URL
-
-async def my_server_save_tv_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    new_source = {
-        "name": context.user_data['new_source_name'],
-        "movie_url": context.user_data['new_movie_url'],
-        "tv_url": update.message.text.strip()
-    }
-    user_collection.update_one(
-        {"user_id": update.effective_user.id},
-        {"$addToSet": {"sources": new_source}},
-        upsert=True
-    )
-    await update.message.reply_text(f"✅ Source '{new_source['name']}' added successfully!")
-    context.user_data.clear()
-
-    keyboard = await _get_server_management_keyboard(update.effective_user.id)
-    await update.message.reply_text(
-        "⚙️ **Server Management**",
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-    return VIEWING_SERVERS
-
-# --- GENCODE ---
-async def gencode_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try:
-        await context.bot.send_chat_action(chat_id=query.from_user.id, action='typing')
-    except BadRequest:
-        await query.answer("Please start a private chat with me first before using this feature.", show_alert=True)
-        return ConversationHandler.END
-
-    await query.answer("Please check your private messages with me to continue.", show_alert=True)
-    try: await query.message.delete()
-    except Exception: pass
-    try:
-        parts = query.data.split("_")
-        tmdb_id, media_type = parts[1], parts[2]
-        if len(parts) == 4 and media_type == 'tv':
-            season_number = int(parts[3])
-            await gencode_generate_and_send(update, context, tmdb_id, media_type, season_number)
-            return ConversationHandler.END
-        elif media_type == 'movie':
-            await gencode_generate_and_send(update, context, tmdb_id, media_type)
-            return ConversationHandler.END
-        else:
-            context.user_data['gencode_info'] = {"tmdb_id": tmdb_id, "media_type": media_type}
-            await context.bot.send_message(chat_id=query.from_user.id, text="Generating code for a TV show.\nPlease enter the Season Number (press Enter for default: 1).")
-            return config.AWAITING_SEASON_CHOICE
+# --- AUTO DELETE CLEANER ---
+async def auto_delete_cleaner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat; message = update.effective_message; user = update.effective_user
+    if chat.type != ChatType.SUPERGROUP: return
+    config_doc = group_configs_collection.find_one({"request_group_id": chat.id})
+    if not config_doc: return
+    protected_thread = config_doc.get("request_thread_id")
+    if not protected_thread or message.message_thread_id != protected_thread: return
+    if await is_user_chat_admin(context, chat.id, user.id): return
+    try: await message.delete()
     except Exception as e:
-        logger.error(f"Error in gencode_start: {e}"); return ConversationHandler.END
-
-async def gencode_handle_season_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    season_input = update.message.text.strip()
-    season = 1
-    if season_input:
-        try: season = int(season_input)
-        except ValueError: await update.message.reply_text("Invalid number. Using default Season 1."); season = 1
-    gencode_info = context.user_data.get('gencode_info', {})
-    if not gencode_info:
-        await update.message.reply_text("An error occurred. Please try generating the code again.")
-        return ConversationHandler.END
-    await gencode_generate_and_send(update, context, gencode_info['tmdb_id'], gencode_info['media_type'], season)
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def gencode_generate_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, tmdb_id: str, media_type: str, season: int = 1):
-    user_id = update.effective_user.id
-    placeholder_message = await context.bot.send_message(chat_id=user_id, text="⏳ Generating code, please wait...")
-
-    try:
-        details, credits = search.get_details(tmdb_id, media_type)
-        if not details:
-            await placeholder_message.edit_text("❌ Could not find details for this item on TMDB. Please check the ID and try again.")
-            return
-
-        extra_details = search.get_extra_details_for_labels(tmdb_id, media_type)
-        year = (details.get('release_date') or details.get('first_air_date') or '')[:4]
-        season_details = {}
-        if media_type == 'tv':
-            media_type_label = 'TV Series'; season_details = search.get_season_details(tmdb_id, season)
-            if season_details.get('air_date'): year = season_details['air_date'][:4]
-        else: media_type_label = 'Movie'
-        labels = [media_type_label]
-        labels.extend([g['name'] for g in details.get('genres', [])])
-        if extra_details.get('rating'): labels.append(f"z{extra_details['rating']}")
-        if year: labels.append(f"zYear:{year}")
-        if media_type == 'movie' and details.get('runtime'): labels.append(f"zDuration:{details.get('runtime')}min")
-        elif media_type == 'tv' and details.get('episode_run_time'):
-            if details.get('episode_run_time'): labels.append(f"zDuration:{details['episode_run_time'][0]}min")
-        if details.get('status') == 'Returning Series': labels.append('zOngoing')
-        elif details.get('status') == 'Ended': labels.append('zEnded')
-        if details.get("production_countries") and details["production_countries"]:
-            labels.append(f"zCountry:{details['production_countries'][0]['iso_3166_1']}")
-        
-        labels_text = ",".join(labels)
-        user_sources_doc = user_collection.find_one({"user_id": user_id})
-        all_possible_sources = list(DEFAULT_SOURCES)
-        if user_sources_doc and "sources" in user_sources_doc:
-            all_possible_sources.extend(user_sources_doc.get("sources", []))
-        disabled_source_names = user_sources_doc.get("disabled_sources", []) if user_sources_doc else []
-        sources_to_use = [source for source in all_possible_sources if source.get("name") not in disabled_source_names]
-        post_id = "5083835698040575230"; poster_url = f"https://image.tmdb.org/t/p/w500{details.get('poster_path', '')}"; overview = details.get('overview', ''); default_thumbnail = f"https://image.tmdb.org/t/p/original{details.get('backdrop_path', '')}"
-        celebrities = [{"name": c.get('name'), "photo": f"https://image.tmdb.org/t/p/w185{c.get('profile_path')}" if c.get('profile_path') else "", "title": c.get('character')} for c in credits.get('cast', [])[:10]]
-        episodes_list, downloads_list = [], []
-        
-        if media_type == 'tv':
-            episodes_data = season_details.get('episodes', [])
-            if not episodes_data:
-                await placeholder_message.edit_text(f"⚠️ Could not find any episodes for Season {season}. Please check the season number on TMDB and try again."); return
-            for ep_data in episodes_data:
-                ep_num = ep_data['episode_number']
-                episodes_list.append({"episode": f"{ep_num:02d}", "thumb": "", "videos": {s['name']: s['tv_url'].format(tmdb_id=tmdb_id, season=season, episode=ep_num) for s in sources_to_use}})
-                downloads_list.append({"source": f"Vidsrc.vip Ep{ep_num}", "quality": "Multiquality", "size": "-", "url": f"https://dl.vidsrc.vip/tv/{tmdb_id}/{season}/{ep_num}"})
-        else: # Movie
-            episodes_list.append({"episode": "01", "thumb": "", "videos": {s['name']: s['movie_url'].format(tmdb_id=tmdb_id) for s in sources_to_use}})
-            downloads_list.append({"source": "Vidsrc.vip Movie", "quality": "Multiquality", "size": "-", "url": f"https://dl.vidsrc.vip/movie/{tmdb_id}"})
-            
-        script_content = f"const defaultThumbnail = '{default_thumbnail}';\nconst episodes = {json.dumps(episodes_list, indent=2)};\nconst downloads = {json.dumps(downloads_list, indent=2)};\nconst celebrities = {json.dumps(celebrities, indent=2)};"
-        html_content = f'<div>\n <span id="post-id" data-post-id="{post_id}"></span>\n  <img alt="poster" src="{poster_url}" />\n  <iframe class="lazyloaded" data-src="/" src="/"></iframe>\n  <p>{overview}</p>\n  <script>\n    {script_content}\n  </script>\n</div>'
-        
-        await placeholder_message.delete()
-        with io.BytesIO(html_content.encode('utf-8')) as f: f.name = 'post_code.txt'; await context.bot.send_document(chat_id=user_id, document=f)
-        with io.BytesIO(labels_text.encode('utf-8')) as f: f.name = 'labels.txt'; await context.bot.send_document(chat_id=user_id, document=f)
-    
-    except Exception as e:
-        logger.error(f"Failed to generate code for user {user_id} with tmdb_id {tmdb_id}: {e}")
-        traceback.print_exc()
-        try:
-            await placeholder_message.edit_text("❌ An unexpected error occurred while generating the code. Please try again later. The developer has been notified.")
-        except Exception as edit_e:
-            logger.error(f"Failed to edit error message: {edit_e}")
+        logger.warning(f"Failed to auto-delete message in topic: {e}")
 
 # --- OTHER HANDLERS ---
-async def search_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); data = query.data
-    if data == "next_page":
-        context.user_data["search_page"] += 1; await search.send_search_page(update, context, edit=True)
-    elif data == "prev_page":
-        context.user_data["search_page"] -= 1; await search.send_search_page(update, context, edit=True)
-    elif data.startswith("select_"):
-        parts = data.split("_")
-        tmdb_id, media_type = parts[1], parts[2]
-        if media_type == 'tv' and len(parts) == 4:
-            season_number = int(parts[3])
-            await search.send_details_display_new(update, context, tmdb_id, media_type, season_number)
-        else: await search.send_details_display_new(update, context, tmdb_id, media_type)
 
-async def handle_season_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    try:
-        _, tmdb_id, season_number_str = query.data.split('_')
-        season_number = int(season_number_str)
-        await search.send_details_display_new(update, context, tmdb_id, 'tv', season_number)
-    except Exception as e:
-        logger.error(f"Error in handle_season_selection: {e}")
-        try: await query.edit_message_text("An error occurred. Please try again.")
-        except BadRequest: pass
-
-async def handle_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try:
-        _, tmdb_id, media_type = query.data.split('_')
-        trailer_url = search.get_trailer_link(tmdb_id, media_type)
-        if trailer_url: await query.answer(url=trailer_url)
-        else: await query.answer("No trailer found for this title.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error handling trailer button: {e}"); await query.answer("Could not fetch trailer.", show_alert=True)
-
-async def handle_copy_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    caption_text = query.message.caption
-    if caption_text: await query.answer(text=caption_text[:199], show_alert=True)
-    else: await query.answer("No details to copy.", show_alert=True)
-
+# --- NEW REACTION HANDLER ---
 async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -670,11 +429,8 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         await query.edit_message_reply_markup(reply_markup=reply_markup)
-    except BadRequest as e:
-        if "message is not modified" in str(e).lower():
-            pass
-        else:
-            logger.error(f"Error updating reaction keyboard: {e}")
+    except BadRequest:
+        pass
 
 async def unified_callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -689,41 +445,83 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-### --- NEW & FIXED --- ### Wrapper functions for restricted search
-async def restricted_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Restrict /search to ONLY be used inside the owner's group
-    if str(update.effective_chat.id) != config.OWNER_GROUP:
-        await update.message.reply_text("This command can only be used in the authorized group.")
-        return
-    await search.search_command(update, context)
+# --- ADMIN WRAPPERS ---
+async def add_theme_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
+    if not is_bot_owner(update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN_MESSAGE)
+        return ConversationHandler.END
+    return await themes.add_theme_start(update, context)
 
-async def restricted_inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Restrict inline search to MEMBERS of the owner's group
-    if not await is_member_of_owner_group(update.inline_query.from_user.id, context):
-        await update.inline_query.answer(
-            [],
-            cache_time=60,
-            switch_pm_text="This feature is restricted to group members.",
-            switch_pm_parameter="start"
-        )
-        return
-    await search.inline_query_handler(update, context)
-### --- END NEW & FIXED --- ###
+async def del_theme_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
+    if not is_bot_owner(update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN_MESSAGE)
+        return ConversationHandler.END
+    return await themes.delete_theme_start(update, context)
+
+async def gen_license_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await delete_command_message(update)
+    if not is_bot_owner(update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN_MESSAGE)
+        return ConversationHandler.END
+    return await licenses.start_gen_license(update, context)
 
 def main():
     persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(config.BOT_TOKEN).persistence(persistence).build()
     cancel_handler = CommandHandler("cancel", cancel)
     
-    # --- Conversation Handlers ---
-    broadcast_conv = ConversationHandler(
-        entry_points=[CommandHandler("broadcast", broadcast.start_broadcast)],
+    # 1. Admin Config
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("start", start, filters=filters.Regex(r'\/start configure_group_'))],
+        states={
+            config.AWAITING_DEST_GROUP_FOR_CONFIG: [
+                MessageHandler(filters.FORWARDED, partial(admin.handle_dest_group_and_save_config, group_configs_collection=group_configs_collection))
+            ],
+            config.AWAITING_DEST_TOPIC_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, partial(admin.handle_dest_topic_selection, group_configs_collection=group_configs_collection))
+            ]
+        },
+        fallbacks=[cancel_handler],
+        name="admin_config_conversation",
+        persistent=True
+    ))
+
+    # 2. Add Theme Conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("addtheme", add_theme_wrapper)],
+        states={
+            config.THEME_GET_NAME: [MessageHandler(filters.TEXT, themes.get_name)],
+            config.THEME_GET_IMAGE: [MessageHandler(filters.PHOTO | filters.TEXT, themes.get_image)],
+            config.THEME_GET_DESC: [MessageHandler(filters.TEXT, themes.get_desc)],
+            config.THEME_GET_DEMO: [MessageHandler(filters.TEXT, themes.get_demo)],
+            config.THEME_GET_DOCS: [MessageHandler(filters.TEXT, themes.get_docs)],
+            config.THEME_GET_BUY: [MessageHandler(filters.TEXT, themes.save_theme)],
+        },
+        fallbacks=[CommandHandler("cancel", themes.cancel)],
+        name="add_theme"
+    ))
+
+    # 3. Delete Theme Conversation
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("deletetheme", del_theme_wrapper)],
+        states={
+            config.THEME_DELETE_CHOICE: [CallbackQueryHandler(themes.handle_delete_theme, pattern=r"^del_theme_|cancel_del")]
+        },
+        fallbacks=[CommandHandler("cancel", themes.cancel)],
+        name="del_theme"
+    ))
+
+    # 4. Broadcast
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("broadcast", start_broadcast_wrapper)],
         states={
             config.GET_THUMBNAIL: [MessageHandler(filters.PHOTO, broadcast.get_thumbnail)],
-            config.GET_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast.get_title)],
-            config.GET_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast.get_description)],
-            config.GET_BUTTONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast.get_buttons)],
-            config.GET_REACTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, partial(broadcast.get_reactions_and_choose_target, user_collection=user_collection))],
+            config.GET_TITLE: [MessageHandler(filters.TEXT, broadcast.get_title)],
+            config.GET_DESCRIPTION: [MessageHandler(filters.TEXT, broadcast.get_description)],
+            config.GET_BUTTONS: [MessageHandler(filters.TEXT, broadcast.get_buttons)],
+            config.GET_REACTIONS: [MessageHandler(filters.TEXT, partial(broadcast.get_reactions_and_choose_target, user_collection=user_collection))],
             config.CHOOSE_TARGET: [
                 CallbackQueryHandler(partial(broadcast.handle_target_choice, user_collection=user_collection, broadcasts_collection=broadcasts_collection), pattern=r"^bcast_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, partial(broadcast.handle_target_choice, user_collection=user_collection, broadcasts_collection=broadcasts_collection))
@@ -733,44 +531,41 @@ def main():
         name="broadcast_conversation",
         persistent=True,
         conversation_timeout=600
-    )
+    ))
 
-    add_group_conv = ConversationHandler(
+    # 5. Add Group
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("addgroup", add_group_start)],
         states={
             config.CHOOSE_GROUP_TYPE: [CallbackQueryHandler(handle_group_type_choice, pattern=r"^add_")],
-            config.AWAITING_SOURCE_GROUP_FORWARD: [MessageHandler(filters.FORWARDED | filters.TEXT & ~filters.COMMAND, handle_source_group_forward)],
-            config.AWAITING_DEST_GROUP_FORWARD: [MessageHandler(filters.FORWARDED | filters.TEXT & ~filters.COMMAND, partial(handle_dest_group_and_save_config, group_configs_collection=group_configs_collection))],
+            config.AWAITING_SOURCE_GROUP_FORWARD: [MessageHandler(filters.FORWARDED | filters.TEXT, handle_source_group_forward)],
+            config.AWAITING_DEST_GROUP_FORWARD: [MessageHandler(filters.FORWARDED | filters.TEXT, partial(handle_dest_group_and_save_config, group_configs_collection=group_configs_collection))],
+            config.AWAITING_DEST_TOPIC_ID: [MessageHandler(filters.TEXT, partial(handle_dest_topic_selection_manual, group_configs_collection=group_configs_collection))],
             config.ADD_BROADCAST_GROUP_ID: [MessageHandler((filters.FORWARDED|filters.TEXT)&~filters.COMMAND, save_broadcast_group)]
         },
         fallbacks=[cancel_handler],
         name="unified_add_group_conversation",
         persistent=True,
         conversation_timeout=300
-    )
-    
-    request_conv = ConversationHandler(
+    ))
+
+    # 6. Request
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("start", start, filters=filters.Regex(r'\/start request_'))],
         states={
-            config.REQ_CHOOSE_TYPE: [CallbackQueryHandler(request.choose_request_type, pattern="^req_")],
-            config.REQ_GET_POSTER: [MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, request.get_poster)],
-            config.REQ_GET_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, request.get_title)],
-            config.REQ_GET_MEDIA_TYPE: [CallbackQueryHandler(request.get_media_type, pattern="^type_")],
-            config.REQ_GET_YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, request.get_year)],
-            config.REQ_GET_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, request.get_country)],
-            config.REQ_GET_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, partial(request.get_final_detail_and_send, group_configs_collection=group_configs_collection))],
-            config.REQ_GET_CONCERN_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, request.get_concern_subject)],
-            config.REQ_GET_CONCERN_IMAGE: [MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, request.get_concern_image)],
-            config.REQ_GET_CONCERN_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, partial(request.get_final_detail_and_send, group_configs_collection=group_configs_collection))]
+            config.REQ_GET_CONCERN_SUBJECT: [MessageHandler(filters.TEXT, request.get_concern_subject)],
+            config.REQ_GET_CONCERN_IMAGE: [MessageHandler(filters.PHOTO | filters.TEXT, request.get_concern_image)],
+            config.REQ_GET_CONCERN_DETAIL: [MessageHandler(filters.TEXT, partial(request.get_final_detail_and_send, group_configs_collection=group_configs_collection))]
         },
         fallbacks=[cancel_handler],
         name="request_conversation",
         persistent=True,
         allow_reentry=True,
         conversation_timeout=300
-    )
+    ))
     
-    admin_remark_conv = ConversationHandler(
+    # 7. Remarks
+    app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(request.start_remark_conversation, pattern=r"^req_remark\|")],
         states={config.AWAITING_REMARK: [MessageHandler(filters.TEXT&~filters.COMMAND, request.handle_admin_remark)]},
         fallbacks=[cancel_handler],
@@ -780,61 +575,45 @@ def main():
         per_chat=False,
         allow_reentry=True,  
         conversation_timeout=300  
-    )
+    ))
 
-    delete_group_conv = ConversationHandler(
+    # 8. Delete Group
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("deletegroup", delete_group_start)],
         states={config.DELETING_GROUP: [CallbackQueryHandler(handle_delete_group_selection, pattern=r"^del_")]},
         fallbacks=[cancel_handler],
         name="delete_group_conversation",
         persistent=True,
         conversation_timeout=300
-    )
+    ))
 
-    gencode_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(gencode_start, pattern=r"^gencode_")],
-        states={config.AWAITING_SEASON_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, gencode_handle_season_choice)]},
-        fallbacks=[cancel_handler],
-        name="gencode_conversation",
-        persistent=True,
-        per_user=True,
-        per_chat=False,
-        conversation_timeout=300
-    )
-
-    my_server_conv = ConversationHandler(
-        entry_points=[CommandHandler("myserver", my_server_start)],
+    # 9. License Gen (Admin)
+    app.add_handler(ConversationHandler(
+        entry_points=[
+            CommandHandler("genlicense", gen_license_wrapper),
+            CommandHandler("createlicense", gen_license_wrapper)
+        ],
         states={
-            VIEWING_SERVERS: [CallbackQueryHandler(my_server_actions, pattern=r"^server_")],
-            DELETING_SERVER_CHOICE: [CallbackQueryHandler(my_server_delete_source, pattern=r"^(delsrc_|server_back)")],
-            config.GET_SOURCE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, my_server_get_source_name)],
-            config.GET_MOVIE_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, my_server_get_movie_url)],
-            config.GET_TV_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, my_server_save_tv_url)],
+            config.LIC_GET_THEME: [CallbackQueryHandler(licenses.handle_theme_selection, pattern=r"^lic_theme_")],
+            config.LIC_GET_DURATION: [CallbackQueryHandler(licenses.handle_duration_selection, pattern=r"^lic_dur_")]
         },
-        fallbacks=[cancel_handler],
-        name="my_server_conversation",
-        persistent=True,
-        conversation_timeout=300
-    )
+        fallbacks=[CommandHandler("cancel", licenses.cancel)],
+        name="lic_gen"
+    ))
 
-    # --- Register Handlers ---
-    app.add_handler(broadcast_conv)
-    app.add_handler(add_group_conv)
-    app.add_handler(request_conv)
-    app.add_handler(admin_remark_conv)
-    app.add_handler(delete_group_conv)
-    app.add_handler(gencode_conv)
-    app.add_handler(my_server_conv)
+    # Theme View Handlers
+    app.add_handler(CommandHandler("theme", themes.theme_command))
+    app.add_handler(CallbackQueryHandler(themes.handle_theme_callback, pattern=r"^theme_"))
 
-    # Specific Callback Query Handlers
-    app.add_handler(CallbackQueryHandler(search_button_handler, pattern=r"^(select_|next_page|prev_page)"))
-    app.add_handler(CallbackQueryHandler(handle_season_selection, pattern=r"^seasonselect_"))
-    app.add_handler(CallbackQueryHandler(handle_trailer, pattern=r"^trailer_"))
-    app.add_handler(CallbackQueryHandler(handle_copy_details, pattern=r"^copy_details_"))
+    # License User Commands
+    app.add_handler(CommandHandler("register", licenses.register_license))
+    app.add_handler(CommandHandler("check", licenses.check_license))
+    app.add_handler(CommandHandler("removedomain", licenses.remove_domain))
+    app.add_handler(CommandHandler("resetlicense", licenses.remove_domain))
+
     app.add_handler(CallbackQueryHandler(request.handle_request_tracking, pattern=r"^req_track\|"))
     app.add_handler(CallbackQueryHandler(handle_reaction, pattern=r"^react_"))
     
-    # Command Handlers
     app.add_handler(CommandHandler("request", partial(request.request_command_in_group, group_configs_collection=group_configs_collection), filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("request", request_in_private, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("start", start, filters=~filters.Regex(r'\/start request_')))
@@ -842,15 +621,10 @@ def main():
     app.add_handler(CommandHandler("mygroups", my_groups))
     app.add_handler(CommandHandler("getid", get_id))
     
-    # --- Register the new restricted search handlers ---
-    app.add_handler(CommandHandler("search", restricted_search_command))
-    app.add_handler(InlineQueryHandler(restricted_inline_query_handler))
-    
-    # Other Handlers
-    app.add_handler(MessageHandler(filters.Regex(r'^\/show_'), search.show_from_inline))
-    
-    # Generic callback handler (must be last) for any buttons that don't have a specific handler
     app.add_handler(CallbackQueryHandler(unified_callback_query_handler))
+
+    # --- AUTO-DELETE HANDLER ---
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, auto_delete_cleaner))
 
     print("🚀 Bot is running...")
     app.run_polling(drop_pending_updates=True)
