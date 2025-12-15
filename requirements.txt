@@ -1,3 +1,5 @@
 python-telegram-bot
 pymongo
 requests
+dnspython
+supabase
